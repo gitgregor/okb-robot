@@ -41,6 +41,7 @@ import {
   cancelOrder,
   fetchPendingOrders,
   fetchOrderHistory,
+  autoDiscoverKeyViaWebSocket,
 } from './services/okxApi';
 import './App.css';
 
@@ -392,22 +393,25 @@ export default function App() {
       try {
         balData = await fetchAccountBalance(activeCreds);
       } catch (firstErr) {
-        if (String(firstErr.code) === '50119') {
-          await new Promise((r) => setTimeout(r, 450));
-          const altCreds = { ...credentials, isDemo: !credentials.isDemo };
-          try {
-            balData = await fetchAccountBalance(altCreds);
-            activeCreds = altCreds;
-            setCredentials((prev) => ({ ...prev, isDemo: altCreds.isDemo }));
-          } catch (secondErr) {
-            if (
-              secondErr.code &&
-              String(secondErr.code) !== '50119' &&
-              String(secondErr.code) !== '50011'
-            ) {
-              setCredentials((prev) => ({ ...prev, isDemo: altCreds.isDemo }));
-              throw secondErr;
+        const codeStr = String(firstErr.code || '');
+        if (codeStr === '50119' || codeStr === '60012' || codeStr === '60009') {
+          const discovered = await autoDiscoverKeyViaWebSocket(activeCreds);
+          if (discovered) {
+            activeCreds = {
+              ...credentials,
+              region: discovered.region,
+              isDemo: discovered.isDemo,
+            };
+            setCredentials((prev) => ({
+              ...prev,
+              region: discovered.region,
+              isDemo: discovered.isDemo,
+            }));
+            if (discovered.ipError) {
+              throw discovered.ipError;
             }
+            balData = discovered.balance || (await fetchAccountBalance(activeCreds));
+          } else {
             throw firstErr;
           }
         } else {
@@ -755,6 +759,7 @@ export default function App() {
         mgnMode: pos.mgnMode,
         posSide: pos.posSide,
         ccy: pos.ccy,
+        pos: pos.pos,
       });
       await loadPrivateData();
     } catch (err) {

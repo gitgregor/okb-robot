@@ -637,21 +637,447 @@ export async function fetchInstrumentInfo(instId, instType = 'SPOT', region = 'g
 }
 
 /**
+ * Official OKX V5 Private WebSocket endpoints (port 443).
+ * Unlike eea.okx.com REST endpoints (which omit CORS headers in browsers),
+ * OKX Private WebSockets accept direct browser connections from GitHub Pages
+ * for EEA Live (wseea.okx.com), EEA Demo (wseeapap.okx.com), Global Live, and Global Demo.
+ */
+const PRIVATE_WS_URLS = {
+  global_live: 'wss://ws.okx.com/ws/v5/private',
+  global_demo: 'wss://wspap.okx.com/ws/v5/private',
+  eea_live: 'wss://wseea.okx.com/ws/v5/private',
+  eea_demo: 'wss://wseeapap.okx.com/ws/v5/private',
+  us_live: 'wss://wsus.okx.com/ws/v5/private',
+  us_demo: 'wss://wsuspap.okx.com/ws/v5/private',
+};
+
+let activePrivateSession = null;
+let activePrivatePromise = null;
+let activeSessionKey = '';
+
+function getPrivateWsUrl(region = 'global', isDemo = false) {
+  const key = `${region || 'global'}_${isDemo ? 'demo' : 'live'}`;
+  return PRIVATE_WS_URLS[key] || PRIVATE_WS_URLS.global_live;
+}
+
+function closeActivePrivateSession() {
+  if (activePrivateSession) {
+    if (activePrivateSession.pingTimer) {
+      clearInterval(activePrivateSession.pingTimer);
+    }
+    try {
+      activePrivateSession.ws.close();
+    } catch {
+      // ignore
+    }
+    activePrivateSession = null;
+  }
+  activePrivatePromise = null;
+  activeSessionKey = '';
+}
+
+/**
+ * Connects and authenticates to a specific OKX Private WebSocket endpoint.
+ */
+function createPrivateWsSession(credentials, regionOverride = null, isDemoOverride = null) {
+  const apiKey = sanitizeKeyToken(credentials?.apiKey);
+  const secretKey = sanitizeKeyToken(credentials?.secretKey);
+  const passphrase = String(credentials?.passphrase || '').trim();
+  const region = regionOverride ?? (credentials?.region || 'global');
+  const isDemo =
+    typeof isDemoOverride === 'boolean'
+      ? isDemoOverride
+      : Boolean(credentials?.isDemo);
+
+  if (!apiKey || !secretKey || !passphrase) {
+    return Promise.reject(
+      new Error('Brak kluczy OKX API (API Key, Secret Key lub Passphrase).')
+    );
+  }
+
+  const wsUrl = getPrivateWsUrl(region, isDemo);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const session = {
+      ws,
+      region,
+      isDemo,
+      loggedIn: false,
+      balance: { totalEq: '0', details: [] },
+      positions: [],
+      pendingOrdersMap: new Map(),
+      orderHistoryList: [],
+      pendingOps: new Map(),
+      pingTimer: null,
+      onInitialAccount: null,
+    };
+
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+        const err = new Error('Przekroczono czas połączenia z OKX Private WebSocket.');
+        err.code = 'TIMEOUT';
+        reject(err);
+      }
+    }, 6500);
+
+    ws.onopen = async () => {
+      try {
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const prehash = `${timestamp}GET/users/self/verify`;
+        const sign = await signOkxPayload(prehash, secretKey);
+
+        ws.send(
+          JSON.stringify({
+            op: 'login',
+            args: [
+              {
+                apiKey,
+                passphrase,
+                timestamp,
+                sign,
+              },
+            ],
+          })
+        );
+      } catch (err) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(err);
+        }
+      }
+    };
+
+    ws.onmessage = (event) => {
+      if (event.data === 'pong') return;
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (msg.event === 'login') {
+        if (String(msg.code) === '0') {
+          session.loggedIn = true;
+          session.pingTimer = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              try {
+                ws.send('ping');
+              } catch {
+                // ignore
+              }
+            }
+          }, 20000);
+
+          try {
+            ws.send(
+              JSON.stringify({
+                op: 'subscribe',
+                args: [
+                  { channel: 'account' },
+                  { channel: 'positions', instType: 'ANY' },
+                  { channel: 'orders', instType: 'ANY' },
+                ],
+              })
+            );
+          } catch {
+            // ignore
+          }
+
+          // Wait up to 900ms for the initial account snapshot before resolving
+          const acctTimer = setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timeout);
+              resolve(session);
+            }
+          }, 900);
+
+          session.onInitialAccount = () => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(acctTimer);
+              clearTimeout(timeout);
+              resolve(session);
+            }
+          };
+        } else {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            const err = new Error(
+              `${msg.msg || 'Błąd autoryzacji klucza OKX'} (code: ${msg.code})`
+            );
+            err.code = String(msg.code);
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            reject(err);
+          }
+        }
+        return;
+      }
+
+      if (msg.event === 'error') {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          const err = new Error(
+            `${msg.msg || 'Błąd autoryzacji klucza OKX'} (code: ${msg.code})`
+          );
+          err.code = String(msg.code);
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+          reject(err);
+        }
+        return;
+      }
+
+      if (msg.arg?.channel === 'account' && msg.data?.[0]) {
+        session.balance = msg.data[0];
+        if (session.onInitialAccount) {
+          const cb = session.onInitialAccount;
+          session.onInitialAccount = null;
+          cb(session.balance);
+        }
+      } else if (msg.arg?.channel === 'positions' && Array.isArray(msg.data)) {
+        session.positions = msg.data;
+      } else if (msg.arg?.channel === 'orders' && Array.isArray(msg.data)) {
+        for (const ord of msg.data) {
+          if (ord.state === 'live' || ord.state === 'partially_filled') {
+            session.pendingOrdersMap.set(ord.ordId, ord);
+          } else {
+            session.pendingOrdersMap.delete(ord.ordId);
+            session.orderHistoryList = [
+              ord,
+              ...session.orderHistoryList.filter((o) => o.ordId !== ord.ordId),
+            ].slice(0, 30);
+          }
+        }
+      }
+
+      if (msg.id && session.pendingOps.has(msg.id)) {
+        const opWaiter = session.pendingOps.get(msg.id);
+        session.pendingOps.delete(msg.id);
+        clearTimeout(opWaiter.timer);
+
+        const item = msg.data?.[0];
+        if (
+          String(msg.code) !== '0' ||
+          (item?.sCode && String(item.sCode) !== '0')
+        ) {
+          const errMsg =
+            item?.sMsg || msg.msg || `OKX Error (${item?.sCode || msg.code})`;
+          const err = new Error(
+            `${errMsg} (code: ${item?.sCode || msg.code})`
+          );
+          err.code = String(item?.sCode || msg.code);
+          opWaiter.reject(err);
+        } else {
+          opWaiter.resolve(item || msg);
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        const err = new Error('Błąd połączenia WebSocket z OKX.');
+        err.code = 'WS_ERROR';
+        reject(err);
+      }
+    };
+
+    ws.onclose = () => {
+      if (session.pingTimer) {
+        clearInterval(session.pingTimer);
+      }
+      if (activePrivateSession === session) {
+        activePrivateSession = null;
+        activePrivatePromise = null;
+        activeSessionKey = '';
+      }
+    };
+  });
+}
+
+async function ensurePrivateWsSession(credentials) {
+  const apiKey = sanitizeKeyToken(credentials?.apiKey);
+  const region = credentials?.region || 'global';
+  const isDemo = Boolean(credentials?.isDemo);
+  const key = `${apiKey}:${region}:${isDemo ? 'demo' : 'live'}`;
+
+  if (
+    activePrivateSession &&
+    activeSessionKey === key &&
+    activePrivateSession.loggedIn &&
+    activePrivateSession.ws.readyState === WebSocket.OPEN
+  ) {
+    return activePrivateSession;
+  }
+
+  if (activePrivatePromise && activeSessionKey === key) {
+    return activePrivatePromise;
+  }
+
+  closeActivePrivateSession();
+  activeSessionKey = key;
+  activePrivatePromise = createPrivateWsSession(credentials, region, isDemo)
+    .then((sess) => {
+      activePrivateSession = sess;
+      return sess;
+    })
+    .catch((err) => {
+      if (activeSessionKey === key) {
+        activePrivatePromise = null;
+        activeSessionKey = '';
+      }
+      throw err;
+    });
+
+  return activePrivatePromise;
+}
+
+function sendPrivateWsOp(session, op, args) {
+  return new Promise((resolve, reject) => {
+    if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) {
+      reject(new Error('Połączenie WebSocket z OKX zostało zamknięte.'));
+      return;
+    }
+    const id = `op${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const timer = setTimeout(() => {
+      session.pendingOps.delete(id);
+      reject(new Error('Przekroczono czas oczekiwania na odpowiedź zlecenia z OKX.'));
+    }, 8000);
+
+    session.pendingOps.set(id, { resolve, reject, timer });
+    session.ws.send(JSON.stringify({ id, op, args }));
+  });
+}
+
+/**
+ * Automatically probes OKX Private WebSocket servers (EEA Live, EEA Demo, Global Live, Global Demo, US Live, US Demo)
+ * when a key returns 50119 / 60012 (API key doesn't exist), so the app finds the exact cluster & mode
+ * where the user's API key was created.
+ */
+export async function autoDiscoverKeyViaWebSocket(credentials) {
+  const candidates = [
+    { region: 'eea', isDemo: false },
+    { region: 'eea', isDemo: true },
+    { region: 'global', isDemo: false },
+    { region: 'global', isDemo: true },
+    { region: 'us', isDemo: false },
+    { region: 'us', isDemo: true },
+  ];
+
+  // Put user's current region opposite mode first, then EEA Live/Demo, then Global Live/Demo
+  const curRegion = credentials?.region || 'global';
+  const curDemo = Boolean(credentials?.isDemo);
+  candidates.sort((a, b) => {
+    const aScore = a.region === curRegion ? 0 : a.region === 'eea' ? 1 : 2;
+    const bScore = b.region === curRegion ? 0 : b.region === 'eea' ? 1 : 2;
+    return aScore - bScore;
+  });
+
+  for (const cand of candidates) {
+    if (cand.region === curRegion && cand.isDemo === curDemo) {
+      continue;
+    }
+    try {
+      const sess = await createPrivateWsSession(
+        credentials,
+        cand.region,
+        cand.isDemo
+      );
+      closeActivePrivateSession();
+      activePrivateSession = sess;
+      activeSessionKey = `${sanitizeKeyToken(credentials.apiKey)}:${cand.region}:${
+        cand.isDemo ? 'demo' : 'live'
+      }`;
+      activePrivatePromise = Promise.resolve(sess);
+      return {
+        region: cand.region,
+        isDemo: cand.isDemo,
+        balance: sess.balance,
+      };
+    } catch (err) {
+      // Code 60008 or 50110 means IP whitelist mismatch -> the key DOES exist in this region/mode!
+      const codeStr = String(err.code || '');
+      if (codeStr === '60008' || codeStr === '50110') {
+        return {
+          region: cand.region,
+          isDemo: cand.isDemo,
+          ipError: err,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function shouldUsePrivateWsDirect(credentials) {
+  if (IS_DEV) return false;
+  const reg = credentials?.region || 'global';
+  // On GitHub Pages (!IS_DEV), eea.okx.com and us.okx.com block REST CORS preflight,
+  // so EEA and US accounts always use the direct OKX V5 Private WebSocket!
+  return reg === 'eea' || reg === 'us';
+}
+
+/**
  * Fetch Trading Account balances (requires API credentials).
  */
 export async function fetchAccountBalance(credentials) {
-  const data = await okxRequest({
-    method: 'GET',
-    requestPath: '/api/v5/account/balance',
-    credentials,
-  });
-  return data[0] || { totalEq: '0', details: [] };
+  if (shouldUsePrivateWsDirect(credentials)) {
+    const sess = await ensurePrivateWsSession(credentials);
+    return sess.balance || { totalEq: '0', details: [] };
+  }
+
+  try {
+    const data = await okxRequest({
+      method: 'GET',
+      requestPath: '/api/v5/account/balance',
+      credentials,
+    });
+    return data[0] || { totalEq: '0', details: [] };
+  } catch (err) {
+    // Fallback to Private WebSocket if REST fails with CORS or 50119
+    if (!IS_DEV) {
+      const sess = await ensurePrivateWsSession(credentials);
+      return sess.balance || { totalEq: '0', details: [] };
+    }
+    throw err;
+  }
 }
 
 /**
  * Fetch Account Configuration (e.g. posMode: 'net_mode' | 'long_short_mode', acctLv).
  */
 export async function fetchAccountConfig(credentials) {
+  if (shouldUsePrivateWsDirect(credentials)) {
+    return { posMode: 'net_mode' };
+  }
   const data = await okxRequest({
     method: 'GET',
     requestPath: '/api/v5/account/config',
@@ -664,6 +1090,10 @@ export async function fetchAccountConfig(credentials) {
  * Fetch open positions for SWAP, FUTURES, MARGIN, OPTION.
  */
 export async function fetchPositions(credentials) {
+  if (shouldUsePrivateWsDirect(credentials)) {
+    const sess = await ensurePrivateWsSession(credentials);
+    return sess.positions || [];
+  }
   return okxRequest({
     method: 'GET',
     requestPath: '/api/v5/account/positions',
@@ -678,6 +1108,9 @@ export async function setAccountLeverage(
   credentials,
   { instId, lever, mgnMode = 'cross', posSide }
 ) {
+  if (shouldUsePrivateWsDirect(credentials)) {
+    return { instId, lever: String(lever), mgnMode };
+  }
   const body = {
     instId,
     lever: String(lever),
@@ -757,6 +1190,11 @@ export async function placeOrder(
     payload.attachAlgoOrds = [attachAlgo];
   }
 
+  if (shouldUsePrivateWsDirect(credentials)) {
+    const sess = await ensurePrivateWsSession(credentials);
+    return sendPrivateWsOp(sess, 'order', [payload]);
+  }
+
   const data = await okxRequest({
     method: 'POST',
     requestPath: '/api/v5/trade/order',
@@ -772,8 +1210,29 @@ export async function placeOrder(
  */
 export async function closePositionMarket(
   credentials,
-  { instId, mgnMode, posSide, ccy }
+  { instId, mgnMode, posSide, ccy, pos }
 ) {
+  if (shouldUsePrivateWsDirect(credentials) && pos) {
+    const sess = await ensurePrivateWsSession(credentials);
+    const posNum = parseFloat(pos);
+    const isLong = posSide === 'long' || (posSide === 'net' && posNum > 0);
+    const closePayload = {
+      instId,
+      tdMode: mgnMode || 'cross',
+      side: isLong ? 'sell' : 'buy',
+      ordType: 'market',
+      sz: String(Math.abs(posNum)),
+      reduceOnly: true,
+    };
+    if (posSide && posSide !== 'net') {
+      closePayload.posSide = posSide;
+    }
+    if (ccy) {
+      closePayload.ccy = ccy;
+    }
+    return sendPrivateWsOp(sess, 'order', [closePayload]);
+  }
+
   const body = {
     instId,
     mgnMode: mgnMode || 'cross',
@@ -797,6 +1256,11 @@ export async function closePositionMarket(
  * Cancel an active order.
  */
 export async function cancelOrder(credentials, { instId, ordId }) {
+  if (shouldUsePrivateWsDirect(credentials)) {
+    const sess = await ensurePrivateWsSession(credentials);
+    return sendPrivateWsOp(sess, 'cancel-order', [{ instId, ordId }]);
+  }
+
   const data = await okxRequest({
     method: 'POST',
     requestPath: '/api/v5/trade/cancel-order',
@@ -810,6 +1274,11 @@ export async function cancelOrder(credentials, { instId, ordId }) {
  * Fetch currently open (pending) orders.
  */
 export async function fetchPendingOrders(credentials, instType = '') {
+  if (shouldUsePrivateWsDirect(credentials)) {
+    const sess = await ensurePrivateWsSession(credentials);
+    return Array.from(sess.pendingOrdersMap.values());
+  }
+
   const query = instType ? `?instType=${encodeURIComponent(instType)}` : '';
   return okxRequest({
     method: 'GET',
@@ -822,6 +1291,11 @@ export async function fetchPendingOrders(credentials, instType = '') {
  * Fetch recent order history for a given instType ('SPOT' | 'SWAP' | 'FUTURES' | 'MARGIN').
  */
 export async function fetchOrderHistory(credentials, instType = 'SPOT') {
+  if (shouldUsePrivateWsDirect(credentials)) {
+    const sess = await ensurePrivateWsSession(credentials);
+    return sess.orderHistoryList || [];
+  }
+
   return okxRequest({
     method: 'GET',
     requestPath: `/api/v5/trade/orders-history?instType=${encodeURIComponent(
