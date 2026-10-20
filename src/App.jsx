@@ -387,14 +387,41 @@ export default function App() {
     setIsLoadingPrivate(true);
     setPrivateError(null);
     try {
-      const balData = await fetchAccountBalance(credentials);
+      let activeCreds = credentials;
+      let balData;
+      try {
+        balData = await fetchAccountBalance(activeCreds);
+      } catch (firstErr) {
+        if (String(firstErr.code) === '50119') {
+          await new Promise((r) => setTimeout(r, 450));
+          const altCreds = { ...credentials, isDemo: !credentials.isDemo };
+          try {
+            balData = await fetchAccountBalance(altCreds);
+            activeCreds = altCreds;
+            setCredentials((prev) => ({ ...prev, isDemo: altCreds.isDemo }));
+          } catch (secondErr) {
+            if (
+              secondErr.code &&
+              String(secondErr.code) !== '50119' &&
+              String(secondErr.code) !== '50011'
+            ) {
+              setCredentials((prev) => ({ ...prev, isDemo: altCreds.isDemo }));
+              throw secondErr;
+            }
+            throw firstErr;
+          }
+        } else {
+          throw firstErr;
+        }
+      }
+
       setAccountBalance(balData);
 
       const [cfgData, posData, openOrd, histOrd] = await Promise.all([
-        fetchAccountConfig(credentials).catch(() => null),
-        fetchPositions(credentials).catch(() => []),
-        fetchPendingOrders(credentials).catch(() => []),
-        fetchOrderHistory(credentials, instType).catch(() => []),
+        fetchAccountConfig(activeCreds).catch(() => null),
+        fetchPositions(activeCreds).catch(() => []),
+        fetchPendingOrders(activeCreds).catch(() => []),
+        fetchOrderHistory(activeCreds, instType).catch(() => []),
       ]);
 
       if (cfgData) {
@@ -1535,6 +1562,41 @@ export default function App() {
               </div>
             )}
 
+            {hasCredentials && privateError && (
+              <div
+                className="feedback-banner error"
+                style={{ flexDirection: 'column', gap: '6px' }}
+              >
+                <div
+                  style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+                >
+                  <AlertCircle size={15} />
+                  <span>Błąd klucza API: {privateError}</span>
+                </div>
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="secondary-sm-btn"
+                    onClick={() =>
+                      setCredentials((prev) => ({
+                        ...prev,
+                        isDemo: !prev.isDemo,
+                      }))
+                    }
+                  >
+                    Przełącz na {credentials.isDemo ? 'Live' : 'Demo'}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-sm-btn"
+                    onClick={() => setShowKeyModal(true)}
+                  >
+                    Sprawdź klucze API
+                  </button>
+                </div>
+              </div>
+            )}
+
             <button
               type="submit"
               disabled={isSubmittingOrder}
@@ -2056,12 +2118,15 @@ export default function App() {
                 <label>API Key (OK-ACCESS-KEY)</label>
                 <input
                   type="text"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   placeholder="np. 8f4c2b10-..."
                   value={credentials.apiKey}
                   onChange={(e) =>
                     setCredentials((prev) => ({
                       ...prev,
-                      apiKey: e.target.value,
+                      apiKey: e.target.value.replace(/\s+/g, ''),
                     }))
                   }
                 />
@@ -2088,12 +2153,15 @@ export default function App() {
                 </div>
                 <input
                   type={showSecrets ? 'text' : 'password'}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   placeholder="Wklej Secret Key"
                   value={credentials.secretKey}
                   onChange={(e) =>
                     setCredentials((prev) => ({
                       ...prev,
-                      secretKey: e.target.value,
+                      secretKey: e.target.value.replace(/\s+/g, ''),
                     }))
                   }
                 />
@@ -2103,6 +2171,9 @@ export default function App() {
                 <label>Passphrase (Hasło klucza API)</label>
                 <input
                   type={showSecrets ? 'text' : 'password'}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   placeholder="Hasło nadane przy tworzeniu klucza API"
                   value={credentials.passphrase}
                   onChange={(e) =>

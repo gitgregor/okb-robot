@@ -293,12 +293,16 @@ function getIsoTimestamp() {
   return new Date().toISOString();
 }
 
+function sanitizeKeyToken(str) {
+  return String(str || '').replace(/[\s\u200B-\u200D\uFEFF]+/g, '');
+}
+
 /**
  * Computes the Base64-encoded HMAC-SHA256 signature required by OKX V5 API.
  */
 async function signOkxPayload(message, secretKey) {
   const encoder = new TextEncoder();
-  const keyData = encoder.encode(secretKey.trim());
+  const keyData = encoder.encode(sanitizeKeyToken(secretKey));
   const msgData = encoder.encode(message);
 
   const cryptoKey = await window.crypto.subtle.importKey(
@@ -447,10 +451,10 @@ async function okxRequest({
     const signature = await signOkxPayload(prehash, secretKey);
 
     headers['Content-Type'] = 'application/json';
-    headers['OK-ACCESS-KEY'] = apiKey.trim();
+    headers['OK-ACCESS-KEY'] = sanitizeKeyToken(apiKey);
     headers['OK-ACCESS-SIGN'] = signature;
     headers['OK-ACCESS-TIMESTAMP'] = timestamp;
-    headers['OK-ACCESS-PASSPHRASE'] = passphrase.trim();
+    headers['OK-ACCESS-PASSPHRASE'] = String(passphrase).trim();
 
     if (isDemo) {
       headers['x-simulated-trading'] = '1';
