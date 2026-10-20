@@ -325,17 +325,25 @@ export default function App() {
         const activeRegion = credentials.region || 'global';
         const [tickerData, bookData] = await Promise.all([
           fetchTicker(pair, activeRegion),
-          fetchOrderBook(pair, 9, activeRegion),
+          fetchOrderBook(pair, 9, activeRegion).catch(() => null),
         ]);
-        setTicker(tickerData);
-        setOrderBook(bookData);
-        setMarketError(null);
-
-        if (populateInitialPrice && tickerData?.last) {
-          setPrice(tickerData.last);
+        if (tickerData) {
+          setTicker(tickerData);
+          setMarketError(null);
+          if (populateInitialPrice && tickerData.last) {
+            setPrice(tickerData.last);
+          }
+        }
+        if (bookData) {
+          setOrderBook(bookData);
         }
       } catch (err) {
-        setMarketError(err.message);
+        setTicker((prev) => {
+          if (!prev) {
+            setMarketError(err.message);
+          }
+          return prev;
+        });
       }
     },
     [credentials.region]

@@ -1,5 +1,8 @@
 const IS_DEV = Boolean(import.meta.env?.DEV);
 
+// Note: In production (GitHub Pages static SPA), only www.okx.com sends
+// Access-Control-Allow-Origin headers for browser CORS requests; eea.okx.com
+// and us.okx.com omit CORS headers and trigger "Failed to fetch" in browsers.
 const REGION_PROXY_MAP = IS_DEV
   ? {
       global: '/okx-global',
@@ -8,8 +11,8 @@ const REGION_PROXY_MAP = IS_DEV
     }
   : {
       global: 'https://www.okx.com',
-      eea: 'https://eea.okx.com',
-      us: 'https://us.okx.com',
+      eea: 'https://www.okx.com',
+      us: 'https://www.okx.com',
     };
 
 export const OKX_REGIONS = [
@@ -316,7 +319,104 @@ async function signOkxPayload(message, secretKey) {
 }
 
 /**
- * Core helper for sending public or authenticated requests to OKX V5 API via the Vite proxy.
+ * WebSocket fallback cache & helper for public market data (tickers & books5)
+ * in case a browser extension, ISP, or CORS preflight blocks REST fetch.
+ */
+const wsMarketCache = {
+  tickers: {},
+  books: {},
+};
+let publicWs = null;
+let publicWsReady = false;
+const subscribedChannels = new Set();
+
+function ensurePublicWebSocket(instId) {
+  if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+  const subKey = `tickers:${instId}`;
+
+  const sendSub = (ws, id) => {
+    try {
+      ws.send(
+        JSON.stringify({
+          op: 'subscribe',
+          args: [
+            { channel: 'tickers', instId: id },
+            { channel: 'books5', instId: id },
+          ],
+        })
+      );
+      subscribedChannels.add(`tickers:${id}`);
+    } catch {
+      // ignore
+    }
+  };
+
+  if (publicWs && publicWs.readyState === WebSocket.OPEN) {
+    if (!subscribedChannels.has(subKey)) {
+      sendSub(publicWs, instId);
+    }
+    return;
+  }
+
+  if (publicWs && publicWs.readyState === WebSocket.CONNECTING) {
+    return;
+  }
+
+  try {
+    publicWs = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
+    publicWs.onopen = () => {
+      publicWsReady = true;
+      sendSub(publicWs, instId);
+    };
+    publicWs.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.arg?.channel === 'tickers' && msg.data?.[0]) {
+          wsMarketCache.tickers[msg.arg.instId] = msg.data[0];
+        } else if (msg.arg?.channel === 'books5' && msg.data?.[0]) {
+          wsMarketCache.books[msg.arg.instId] = msg.data[0];
+        }
+      } catch {
+        // ignore parse errors
+      }
+    };
+    publicWs.onerror = () => {
+      publicWsReady = false;
+    };
+    publicWs.onclose = () => {
+      publicWsReady = false;
+      publicWs = null;
+      subscribedChannels.clear();
+    };
+  } catch {
+    // ignore WebSocket creation errors
+  }
+}
+
+function waitForWsSnapshot(type, instId, timeoutMs = 2500) {
+  ensurePublicWebSocket(instId);
+  const store = type === 'ticker' ? wsMarketCache.tickers : wsMarketCache.books;
+  if (store[instId]) {
+    return Promise.resolve(store[instId]);
+  }
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      if (store[instId]) {
+        clearInterval(timer);
+        resolve(store[instId]);
+      } else if (Date.now() - start >= timeoutMs) {
+        clearInterval(timer);
+        resolve(null);
+      }
+    }, 120);
+  });
+}
+
+/**
+ * Core helper for sending public or authenticated requests to OKX V5 API.
+ * Uses CORS Simple Requests (no custom headers) for unauthenticated GET calls
+ * so browsers do not trigger OPTIONS preflight requests.
  */
 async function okxRequest({
   method = 'GET',
@@ -327,12 +427,14 @@ async function okxRequest({
 }) {
   const upperMethod = method.toUpperCase();
   const bodyString = body ? JSON.stringify(body) : '';
-  const headers = {
-    'Content-Type': 'application/json',
-  };
+  const headers = {};
 
   const regionKey = regionOverride || credentials?.region || 'global';
   const proxyPrefix = REGION_PROXY_MAP[regionKey] || REGION_PROXY_MAP.global;
+
+  if (upperMethod === 'POST') {
+    headers['Content-Type'] = 'application/json';
+  }
 
   if (credentials) {
     const { apiKey, secretKey, passphrase, isDemo } = credentials;
@@ -344,6 +446,7 @@ async function okxRequest({
     const prehash = `${timestamp}${upperMethod}${requestPath}${bodyString}`;
     const signature = await signOkxPayload(prehash, secretKey);
 
+    headers['Content-Type'] = 'application/json';
     headers['OK-ACCESS-KEY'] = apiKey.trim();
     headers['OK-ACCESS-SIGN'] = signature;
     headers['OK-ACCESS-TIMESTAMP'] = timestamp;
@@ -354,11 +457,33 @@ async function okxRequest({
     }
   }
 
-  const response = await fetch(`${proxyPrefix}${requestPath}`, {
+  const hasHeaders = Object.keys(headers).length > 0;
+  const fetchOptions = {
     method: upperMethod,
-    headers,
-    body: upperMethod === 'POST' ? bodyString : undefined,
-  });
+    ...(hasHeaders ? { headers } : {}),
+    ...(upperMethod === 'POST' ? { body: bodyString } : {}),
+  };
+
+  let response;
+  let lastNetworkErr;
+  const maxAttempts = credentials ? 1 : 2;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      response = await fetch(`${proxyPrefix}${requestPath}`, fetchOptions);
+      lastNetworkErr = null;
+      break;
+    } catch (err) {
+      lastNetworkErr = err;
+      if (attempt + 1 < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  }
+
+  if (lastNetworkErr) {
+    throw lastNetworkErr;
+  }
 
   const json = await response.json().catch(() => null);
 
@@ -436,8 +561,8 @@ export async function fetchCategoryCatalog(category, region = 'global') {
 
   // Standard single instType category ('SPOT' | 'SWAP' | 'FUTURES' | 'MARGIN')
   const [instList, tickersList] = await Promise.all([
-    fetchAllInstruments(category, region),
-    fetchAllTickers(category, region),
+    fetchAllInstruments(category, region).catch(() => []),
+    fetchAllTickers(category, region).catch(() => []),
   ]);
 
   const tickersMap = {};
@@ -449,27 +574,48 @@ export async function fetchCategoryCatalog(category, region = 'global') {
 }
 
 /**
- * Fetch live ticker for a single instrument.
+ * Fetch live ticker for a single instrument (with automatic WebSocket fallback).
  */
 export async function fetchTicker(instId, region = 'global') {
-  const data = await okxRequest({
-    method: 'GET',
-    requestPath: `/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`,
-    regionOverride: region,
-  });
-  return data[0] || null;
+  ensurePublicWebSocket(instId);
+  try {
+    const data = await okxRequest({
+      method: 'GET',
+      requestPath: `/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`,
+      regionOverride: region,
+    });
+    if (data[0]) {
+      wsMarketCache.tickers[instId] = data[0];
+      return data[0];
+    }
+  } catch (err) {
+    const wsFallback = await waitForWsSnapshot('ticker', instId);
+    if (wsFallback) return wsFallback;
+    throw err;
+  }
+  return wsMarketCache.tickers[instId] || null;
 }
 
 /**
- * Fetch live order book depth for an instrument.
+ * Fetch live order book depth for an instrument (with automatic WebSocket fallback).
  */
 export async function fetchOrderBook(instId, sz = 8, region = 'global') {
-  const data = await okxRequest({
-    method: 'GET',
-    requestPath: `/api/v5/market/books?instId=${encodeURIComponent(instId)}&sz=${sz}`,
-    regionOverride: region,
-  });
-  return data[0] || { asks: [], bids: [] };
+  ensurePublicWebSocket(instId);
+  try {
+    const data = await okxRequest({
+      method: 'GET',
+      requestPath: `/api/v5/market/books?instId=${encodeURIComponent(instId)}&sz=${sz}`,
+      regionOverride: region,
+    });
+    if (data[0]) {
+      wsMarketCache.books[instId] = data[0];
+      return data[0];
+    }
+  } catch {
+    const wsFallback = await waitForWsSnapshot('books', instId);
+    if (wsFallback) return wsFallback;
+  }
+  return wsMarketCache.books[instId] || { asks: [], bids: [] };
 }
 
 /**
