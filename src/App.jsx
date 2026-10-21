@@ -20,6 +20,8 @@ import {
   Layers,
   Sliders,
   Activity,
+  Bot,
+  Cpu,
 } from 'lucide-react';
 import {
   OKX_REGIONS,
@@ -43,6 +45,7 @@ import {
   fetchOrderHistory,
   autoDiscoverKeyViaWebSocket,
 } from './services/okxApi';
+import AutoTradingPanels from './components/AutoTradingPanels';
 import './App.css';
 
 const STORAGE_KEY = 'okx_trader_credentials_v1';
@@ -193,6 +196,10 @@ export default function App() {
   const [marketTgtCcy, setMarketTgtCcy] = useState('quote_ccy');
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [orderFeedback, setOrderFeedback] = useState(null);
+
+  // Separate Master States for Automated Rule Bot & Autonomous AI Agent
+  const [autoBotEnabled, setAutoBotEnabled] = useState(false);
+  const [aiAgentEnabled, setAiAgentEnabled] = useState(false);
 
   const hasCredentials = Boolean(
     credentials.apiKey.trim() &&
@@ -880,6 +887,32 @@ export default function App() {
               Live
             </button>
           </div>
+
+          <button
+            type="button"
+            className={`top-module-status-pill ${
+              autoBotEnabled ? 'bot-on' : 'bot-off'
+            }`}
+            onClick={() => setAutoBotEnabled((v) => !v)}
+            title="Kliknij aby włączyć/wyłączyć Automatyczny Handel (Reguły)"
+          >
+            <Bot size={14} />
+            <span>Auto-Bot: {autoBotEnabled ? 'AKTYWNY' : 'WYŁ.'}</span>
+            <span className="status-dot" />
+          </button>
+
+          <button
+            type="button"
+            className={`top-module-status-pill ${
+              aiAgentEnabled ? 'ai-on' : 'bot-off'
+            }`}
+            onClick={() => setAiAgentEnabled((v) => !v)}
+            title="Kliknij aby aktywować/deaktywować Autonomicznego Agenta AI"
+          >
+            <Cpu size={14} />
+            <span>Agent AI: {aiAgentEnabled ? 'AKTYWNY' : 'WYŁ.'}</span>
+            <span className="status-dot" />
+          </button>
 
           <button
             type="button"
@@ -1778,6 +1811,23 @@ export default function App() {
         </section>
       </main>
 
+      {/* Automated Trading (Rule Bot) + Autonomous AI Agent + Action History */}
+      <AutoTradingPanels
+        instId={instId}
+        instType={instType}
+        ticker={ticker}
+        orderBook={orderBook}
+        credentials={credentials}
+        hasCredentials={hasCredentials}
+        accountBalance={accountBalance}
+        onSelectInstrument={selectInstrument}
+        onRefreshPrivateData={loadPrivateData}
+        autoBotEnabled={autoBotEnabled}
+        setAutoBotEnabled={setAutoBotEnabled}
+        aiAgentEnabled={aiAgentEnabled}
+        setAiAgentEnabled={setAiAgentEnabled}
+      />
+
       {/* Bottom Panel: Positions, Open Orders & Order History */}
       <section className="card orders-panel">
         <div className="orders-header">
@@ -2259,6 +2309,19 @@ export default function App() {
         >
           <Search size={18} />
           <span>Rynki</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-btn ${
+            mobileView === 'auto' ? 'active' : ''
+          }`}
+          onClick={() => setMobileView('auto')}
+        >
+          <Bot size={18} />
+          <span>
+            Auto / AI
+            {autoBotEnabled || aiAgentEnabled ? ' ●' : ''}
+          </span>
         </button>
         <button
           type="button"
