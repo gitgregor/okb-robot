@@ -177,6 +177,11 @@ export default function App() {
   const [activeBottomTab, setActiveBottomTab] = useState('positions');
   const [isLoadingPrivate, setIsLoadingPrivate] = useState(false);
   const [privateError, setPrivateError] = useState(null);
+  const [automationBook, setAutomationBook] = useState({
+    activePositions: [],
+    pendingTargetOrders: [],
+    executedOrders: [],
+  });
 
   // Order Form State
   const [side, setSide] = useState('buy'); // 'buy' | 'sell'
@@ -852,9 +857,66 @@ export default function App() {
     return (szNum * refPx).toFixed(4);
   })();
 
-  const activePositions = positions.filter(
+  const derivativePositions = positions.filter(
     (p) => parseFloat(p.pos || '0') !== 0
   );
+
+  const automationMappedPositions = (automationBook.activePositions || []).map(
+    (ap) => {
+      const entryPx = Number(ap.entryPrice || 0);
+      const curPx =
+        allTickersMap[ap.instId]?.last
+          ? parseFloat(allTickersMap[ap.instId].last)
+          : Number(ap.currentPrice || entryPx);
+      const qty = Number(ap.qty || 0);
+      const uplVal = entryPx > 0 ? (curPx - entryPx) * qty : 0;
+      const uplRatioVal = entryPx > 0 ? (curPx - entryPx) / entryPx : 0;
+      return {
+        instId: ap.instId,
+        instType: ap.instType || 'SPOT',
+        mgnMode: ap.source || 'AI / SPOT',
+        lever: '1',
+        posSide: 'long',
+        pos: qty.toFixed(4),
+        avgPx: entryPx.toFixed(entryPx >= 100 ? 2 : 5),
+        markPx: curPx.toFixed(curPx >= 100 ? 2 : 5),
+        liqPx: ap.tpPrice ? `TP: ${ap.tpPrice} / SL: ${ap.slPrice}` : '—',
+        upl: String(uplVal),
+        uplRatio: String(uplRatioVal),
+        isAutomationPosition: true,
+      };
+    }
+  );
+
+  const activePositions = [
+    ...derivativePositions,
+    ...automationMappedPositions.filter(
+      (ap) => !derivativePositions.some((dp) => dp.instId === ap.instId)
+    ),
+  ];
+
+  const combinedPendingOrders = [
+    ...pendingOrders,
+    ...(automationBook.pendingTargetOrders || []).filter(
+      (to) => !pendingOrders.some((po) => po.ordId === to.ordId)
+    ),
+  ];
+
+  const combinedOrderHistory = (() => {
+    const seen = new Set();
+    const list = [];
+    for (const ord of [
+      ...(automationBook.executedOrders || []),
+      ...orderHistory,
+    ]) {
+      const key = ord.ordId || `${ord.instId}-${ord.cTime}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        list.push(ord);
+      }
+    }
+    return list;
+  })();
 
   return (
     <div className={`app-shell mobile-view-${mobileView}`}>
@@ -1872,6 +1934,7 @@ export default function App() {
         setAiAgentEnabled={setAiAgentEnabled}
         onUserToggleAiAgent={handleUserToggleAiAgent}
         userToggleSignal={userToggleSignal}
+        onSyncAutomationBook={setAutomationBook}
       />
 
       {/* Bottom Panel: Positions, Open Orders & Order History */}
@@ -1896,7 +1959,7 @@ export default function App() {
               onClick={() => setActiveBottomTab('open')}
             >
               <Clock size={15} />
-              Otwarte Zlecenia ({pendingOrders.length})
+              Otwarte Zlecenia ({combinedPendingOrders.length})
             </button>
             <button
               type="button"
@@ -1906,7 +1969,7 @@ export default function App() {
               onClick={() => setActiveBottomTab('history')}
             >
               <History size={15} />
-              Historia Zleceń ({instType}) ({orderHistory.length})
+              Historia Zleceń ({combinedOrderHistory.length})
             </button>
           </div>
 
@@ -1923,14 +1986,10 @@ export default function App() {
           )}
         </div>
 
-        {!hasCredentials ? (
-          <div className="orders-empty">
-            Połącz klucze OKX API powyżej, aby zarządzać pozycjami i zleceniami.
-          </div>
-        ) : activeBottomTab === 'positions' ? (
+        {activeBottomTab === 'positions' ? (
           activePositions.length === 0 ? (
             <div className="orders-empty">
-              Brak otwartych pozycji derywatów / margin.
+              Brak otwartych pozycji. Włącz Autonomicznego Agenta AI lub Auto-Bota powyżej, albo otwórz pozycję ręcznie.
             </div>
           ) : (
             <div className="table-responsive">
@@ -1938,11 +1997,11 @@ export default function App() {
                 <thead>
                   <tr>
                     <th>Instrument</th>
-                    <th>Tryb / Dźwignia</th>
+                    <th>Źródło / Tryb</th>
                     <th>Wielkość</th>
                     <th>Cena wejścia</th>
-                    <th>Cena Mark</th>
-                    <th>Cena likwidacji</th>
+                    <th>Cena bieżąca</th>
+                    <th>Cel TP / SL / Likwidacja</th>
                     <th>Niezrealizowane PnL</th>
                     <th>Akcja</th>
                   </tr>
@@ -1970,8 +2029,13 @@ export default function App() {
                           </strong>
                         </td>
                         <td>
-                          <span className="uppercase">{pos.mgnMode}</span> •{' '}
-                          <strong>{pos.lever}x</strong>
+                          <span className="uppercase">{pos.mgnMode}</span>
+                          {!pos.isAutomationPosition && (
+                            <>
+                              {' '}
+                              • <strong>{pos.lever}x</strong>
+                            </>
+                          )}
                         </td>
                         <td>
                           <span
@@ -1984,7 +2048,9 @@ export default function App() {
                         </td>
                         <td>{pos.avgPx}</td>
                         <td>{pos.markPx}</td>
-                        <td className="neg">{pos.liqPx || '—'}</td>
+                        <td className={pos.isAutomationPosition ? '' : 'neg'}>
+                          {pos.liqPx || '—'}
+                        </td>
                         <td className={upl >= 0 ? 'pos' : 'neg'}>
                           <strong>
                             {upl >= 0 ? '+' : ''}
@@ -1993,13 +2059,25 @@ export default function App() {
                           </strong>
                         </td>
                         <td>
-                          <button
-                            type="button"
-                            className="cancel-ord-btn"
-                            onClick={() => handleClosePosition(pos)}
-                          >
-                            Zamknij Market
-                          </button>
+                          {pos.isAutomationPosition ? (
+                            <button
+                              type="button"
+                              className="secondary-sm-btn"
+                              onClick={() =>
+                                selectInstrument(pos.instId, pos.instType, true)
+                              }
+                            >
+                              Pokaż wykres
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="cancel-ord-btn"
+                              onClick={() => handleClosePosition(pos)}
+                            >
+                              Zamknij Market
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );
@@ -2009,7 +2087,7 @@ export default function App() {
             </div>
           )
         ) : activeBottomTab === 'open' ? (
-          pendingOrders.length === 0 ? (
+          combinedPendingOrders.length === 0 ? (
             <div className="orders-empty">
               Brak aktywnych oczekujących zleceń.
             </div>
@@ -2023,20 +2101,27 @@ export default function App() {
                     <th>Typ rynku</th>
                     <th>Rodzaj</th>
                     <th>Strona</th>
-                    <th>Cena</th>
+                    <th>Cena docelowa</th>
                     <th>Ilość</th>
-                    <th>Wypełniono</th>
+                    <th>Status / Wypełniono</th>
                     <th>Akcja</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {pendingOrders.map((ord) => (
+                  {combinedPendingOrders.map((ord) => (
                     <tr key={ord.ordId}>
                       <td>
                         {new Date(Number(ord.cTime)).toLocaleTimeString()}
                       </td>
                       <td>
-                        <strong>{ord.instId}</strong>
+                        <strong
+                          style={{ cursor: 'pointer' }}
+                          onClick={() =>
+                            selectInstrument(ord.instId, 'SPOT', true)
+                          }
+                        >
+                          {ord.instId}
+                        </strong>
                       </td>
                       <td>{ord.instType}</td>
                       <td className="uppercase">{ord.ordType}</td>
@@ -2053,16 +2138,22 @@ export default function App() {
                       <td>{ord.sz}</td>
                       <td>{ord.accFillSz || '0'}</td>
                       <td>
-                        <button
-                          type="button"
-                          className="cancel-ord-btn"
-                          onClick={() =>
-                            handleCancelOrder(ord.instId, ord.ordId)
-                          }
-                        >
-                          <XCircle size={14} />
-                          Anuluj
-                        </button>
+                        {ord.isAutomationTarget ? (
+                          <span className="state-pill state-live">
+                            Aktywny TP/SL
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="cancel-ord-btn"
+                            onClick={() =>
+                              handleCancelOrder(ord.instId, ord.ordId)
+                            }
+                          >
+                            <XCircle size={14} />
+                            Anuluj
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -2070,9 +2161,9 @@ export default function App() {
               </table>
             </div>
           )
-        ) : orderHistory.length === 0 ? (
+        ) : combinedOrderHistory.length === 0 ? (
           <div className="orders-empty">
-            Brak historii zleceń dla kategorii {instType}.
+            Brak historii zleceń. Włącz Autonomicznego Agenta AI lub złóż zlecenie, aby zobaczyć historię.
           </div>
         ) : (
           <div className="table-responsive">
@@ -2081,21 +2172,22 @@ export default function App() {
                 <tr>
                   <th>Czas</th>
                   <th>Instrument</th>
-                  <th>Rodzaj</th>
+                  <th>Źródło / Rodzaj</th>
                   <th>Strona</th>
                   <th>Śr. cena wykonania</th>
                   <th>Wykonano / Ilość</th>
-                  <th>PnL</th>
+                  <th>PnL ($)</th>
                   <th>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {orderHistory.map((ord) => (
+                {combinedOrderHistory.map((ord) => (
                   <tr key={ord.ordId}>
                     <td>
-                      {new Date(
-                        Number(ord.uTime || ord.cTime)
-                      ).toLocaleString()}
+                      {ord.timeLabel ||
+                        new Date(
+                          Number(ord.uTime || ord.cTime)
+                        ).toLocaleString()}
                     </td>
                     <td>
                       <strong>{ord.instId}</strong>
@@ -2104,10 +2196,14 @@ export default function App() {
                     <td>
                       <span
                         className={`badge ${
-                          ord.side === 'buy' ? 'badge-buy' : 'badge-sell'
+                          ord.side === 'buy'
+                            ? 'badge-buy'
+                            : ord.side === 'swap'
+                            ? 'badge-swap'
+                            : 'badge-sell'
                         }`}
                       >
-                        {ord.side.toUpperCase()}
+                        {(ord.sideLabel || ord.side || 'BUY').toUpperCase()}
                       </span>
                     </td>
                     <td>
@@ -2116,7 +2212,9 @@ export default function App() {
                         : ord.px || 'Market'}
                     </td>
                     <td>
-                      {ord.accFillSz} / {ord.sz}
+                      {ord.isAutomationHistory
+                        ? ord.sz
+                        : `${ord.accFillSz} / ${ord.sz}`}
                     </td>
                     <td
                       className={
@@ -2128,11 +2226,13 @@ export default function App() {
                       }
                     >
                       {ord.pnl && ord.pnl !== '0'
-                        ? Number(ord.pnl).toFixed(4)
+                        ? `${parseFloat(ord.pnl) > 0 ? '+' : ''}${Number(
+                            ord.pnl
+                          ).toFixed(4)}`
                         : '—'}
                     </td>
                     <td>
-                      <span className={`state-pill state-${ord.state}`}>
+                      <span className="state-pill state-filled">
                         {ord.state}
                       </span>
                     </td>
@@ -2379,8 +2479,8 @@ export default function App() {
           <Activity size={18} />
           <span>
             Zlecenia
-            {activePositions.length + pendingOrders.length > 0
-              ? ` (${activePositions.length + pendingOrders.length})`
+            {activePositions.length + combinedPendingOrders.length > 0
+              ? ` (${activePositions.length + combinedPendingOrders.length})`
               : ''}
           </span>
         </button>

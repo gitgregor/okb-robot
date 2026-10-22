@@ -509,6 +509,16 @@ async function okxRequest({
 // Cache of numeric instIdCode & metadata per instId (required by OKX V5 WebSocket trade operations)
 const instIdCodeCache = new Map();
 const instInfoCache = new Map();
+const regionalWsCatalogCache = new Map();
+
+const PUBLIC_WS_URLS = {
+  global_live: 'wss://ws.okx.com:8443/ws/v5/public',
+  global_demo: 'wss://wspap.okx.com:8443/ws/v5/public',
+  eea_live: 'wss://wseea.okx.com/ws/v5/public',
+  eea_demo: 'wss://wseeapap.okx.com/ws/v5/public',
+  us_live: 'wss://wsus.okx.com/ws/v5/public',
+  us_demo: 'wss://wsuspap.okx.com/ws/v5/public',
+};
 
 function cacheInstrumentsMetadata(list) {
   if (!Array.isArray(list)) return;
@@ -525,9 +535,108 @@ function cacheInstrumentsMetadata(list) {
 }
 
 /**
+ * Fetch exact regional & demo/live instrument catalog via OKX V5 Public WebSocket
+ * (bypasses browser REST CORS on eea.okx.com and returns exact regional instId + instIdCode).
+ */
+export async function fetchRegionalInstrumentsViaWs(
+  instType = 'SPOT',
+  region = 'global',
+  isDemo = false
+) {
+  const cacheKey = `${region || 'global'}_${isDemo ? 'demo' : 'live'}_${instType}`;
+  const cached = regionalWsCatalogCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000 && cached.data?.length > 0) {
+    return cached.data;
+  }
+
+  const wsUrlKey = `${region || 'global'}_${isDemo ? 'demo' : 'live'}`;
+  const wsUrl = PUBLIC_WS_URLS[wsUrlKey] || PUBLIC_WS_URLS.global_live;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch {
+      resolve(null);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+        resolve(null);
+      }
+    }, 3200);
+
+    ws.onopen = () => {
+      try {
+        ws.send(
+          JSON.stringify({
+            op: 'subscribe',
+            args: [{ channel: 'instruments', instType }],
+          })
+        );
+      } catch {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(null);
+        }
+      }
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.arg?.channel === 'instruments' && Array.isArray(msg.data) && msg.data.length > 0) {
+          cacheInstrumentsMetadata(msg.data);
+          regionalWsCatalogCache.set(cacheKey, { ts: Date.now(), data: msg.data });
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            resolve(msg.data);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    ws.onerror = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(null);
+      }
+    };
+  });
+}
+
+/**
  * Fetch all available instruments for a given instType ('SPOT' | 'SWAP' | 'FUTURES' | 'MARGIN').
  */
-export async function fetchAllInstruments(instType = 'SPOT', region = 'global') {
+export async function fetchAllInstruments(
+  instType = 'SPOT',
+  region = 'global',
+  isDemo = false
+) {
+  if (!IS_DEV && (region === 'eea' || region === 'us' || isDemo)) {
+    const wsData = await fetchRegionalInstrumentsViaWs(instType, region, isDemo);
+    if (Array.isArray(wsData) && wsData.length > 0) {
+      return wsData;
+    }
+  }
   const data = await okxRequest({
     method: 'GET',
     requestPath: `/api/v5/public/instruments?instType=${encodeURIComponent(instType)}`,
@@ -670,13 +779,33 @@ export async function fetchInstrumentInfo(instId, instType = 'SPOT', region = 'g
 /**
  * Resolve numeric instIdCode for an instId (required by OKX V5 WebSocket op: 'order' / 'cancel-order').
  */
-export async function resolveInstIdCode(instId, instType = 'SPOT', region = 'global') {
+export async function resolveInstIdCode(
+  instId,
+  instType = 'SPOT',
+  region = 'global',
+  isDemo = false
+) {
   if (!instId) return undefined;
   if (instIdCodeCache.has(instId)) {
     return instIdCodeCache.get(instId);
   }
+  const inferredType =
+    instType ||
+    (instId?.endsWith('-SWAP')
+      ? 'SWAP'
+      : instId?.split('-').length > 2
+      ? 'FUTURES'
+      : 'SPOT');
+  if (!IS_DEV && (region === 'eea' || region === 'us' || isDemo)) {
+    await fetchRegionalInstrumentsViaWs(inferredType, region, isDemo).catch(
+      () => null
+    );
+    if (instIdCodeCache.has(instId)) {
+      return instIdCodeCache.get(instId);
+    }
+  }
   try {
-    const info = await fetchInstrumentInfo(instId, instType, region);
+    const info = await fetchInstrumentInfo(instId, inferredType, region);
     if (info?.instIdCode !== undefined && info?.instIdCode !== null && info?.instIdCode !== '') {
       const numCode = Number(info.instIdCode);
       if (!Number.isNaN(numCode)) {
@@ -1249,13 +1378,47 @@ export async function placeOrder(
     const code =
       instIdCode !== undefined && instIdCode !== null && instIdCode !== ''
         ? Number(instIdCode)
-        : await resolveInstIdCode(instId, instType, credentials?.region || 'global');
+        : await resolveInstIdCode(
+            instId,
+            instType,
+            credentials?.region || 'global',
+            Boolean(credentials?.isDemo)
+          );
     const wsPayload = { ...payload };
     if (code !== undefined && !Number.isNaN(code)) {
       wsPayload.instIdCode = code;
     }
     const sess = await ensurePrivateWsSession(credentials);
-    return sendPrivateWsOp(sess, 'order', [wsPayload]);
+    const wsRes = await sendPrivateWsOp(sess, 'order', [wsPayload]);
+    const ordId = wsRes?.ordId || `ws-${Date.now()}`;
+    const syntheticOrd = {
+      ordId,
+      instId,
+      instType,
+      ordType,
+      side,
+      px: px || '',
+      avgPx: px || '',
+      sz: String(sz).trim(),
+      accFillSz: ordType === 'market' ? String(sz).trim() : '0',
+      state: ordType === 'market' ? 'filled' : 'live',
+      cTime: String(Date.now()),
+      uTime: String(Date.now()),
+      pnl: '0',
+    };
+    if (ordType === 'limit') {
+      if (!sess.pendingOrdersMap.has(ordId)) {
+        sess.pendingOrdersMap.set(ordId, syntheticOrd);
+      }
+    } else {
+      if (!sess.orderHistoryList.some((o) => o.ordId === ordId)) {
+        sess.orderHistoryList = [syntheticOrd, ...sess.orderHistoryList].slice(
+          0,
+          40
+        );
+      }
+    }
+    return wsRes;
   };
 
   if (shouldUsePrivateWsDirect(credentials)) {

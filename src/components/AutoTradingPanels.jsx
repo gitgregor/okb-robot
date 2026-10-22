@@ -47,6 +47,44 @@ const CROSS_DEVICE_SYNC_TOPIC = 'okb_robot_gitgregor_live_sync_v2';
 const NTFY_BASE_URL = 'https://ntfy.sh';
 const NTFY_WS_URL = 'wss://ntfy.sh';
 
+// Major high-liquidity bases verified across OKX EEA & Global
+const PRIORITY_LIQUID_BASES = new Set([
+  'ONDO',
+  'BTC',
+  'ETH',
+  'SOL',
+  'XRP',
+  'DOGE',
+  'SUI',
+  'PEPE',
+  'ADA',
+  'AVAX',
+  'LINK',
+  'NEAR',
+  'AAVE',
+  'UNI',
+  'DOT',
+  'LTC',
+  'RENDER',
+  'FET',
+  'ARB',
+  'OP',
+  'APT',
+  'INJ',
+  'TIA',
+  'SEI',
+  'BONK',
+  'SHIB',
+  'OKB',
+  'PAXG',
+  'XAUT',
+  'XNVDA',
+  'XTSLA',
+  'XAAPL',
+  'ANTHROPIC',
+  'OPENAI',
+]);
+
 function getOrCreateDeviceId() {
   try {
     const existing = localStorage.getItem(DEVICE_ID_KEY);
@@ -114,6 +152,7 @@ export default function AutoTradingPanels({
   accountBalance,
   onSelectInstrument,
   onRefreshPrivateData,
+  onSyncAutomationBook,
   autoBotEnabled,
   setAutoBotEnabled,
   onUserToggleAutoBot,
@@ -206,7 +245,7 @@ export default function AutoTradingPanels({
       stopLossPct: '1.8',
       scanIntervalSec: '20',
       allowAssetRotation: true, // Zamiana słabszych aktywów na bardziej zyskowne
-      minRotationAdvantageScore: '22', // O ile pkt nowe aktywo musi być lepsze aby dokonać zamiany
+      minRotationAdvantageScore: '15', // O ile pkt nowe aktywo musi być lepsze aby dokonać zamiany
       riskProfile: 'balanced', // 'conservative' | 'balanced' | 'aggressive'
       allowedMarkets: {
         SPOT: true,
@@ -235,7 +274,7 @@ export default function AutoTradingPanels({
     scannedCount: 0,
     topOpportunities: [],
     currentThought:
-      'Agent AI gotowy. Po aktywacji będzie samodzielnie skanował wszystkie rynki OKX, realizował profity i zamieniał słabsze aktywa na bardziej opłacalne.',
+      'Agent AI gotowy. Po aktywacji będzie samodzielnie skanował wszystkie rynki OKX, kupował najlepsze okazje, realizował profity i zamieniał słabsze aktywa na bardziej opłacalne.',
     cumulativeProfitUsd: 0,
     totalSwapsCount: 0,
     totalTradesCount: 0,
@@ -323,79 +362,221 @@ export default function AutoTradingPanels({
     }
   }, [actionHistory]);
 
+  // Report active positions, pending TP/SL target orders, and executed order history up to App.jsx
+  // so the bottom panel ("Otwarte Pozycje", "Otwarte Zlecenia", "Historia Zleceń") is always populated!
+  useEffect(() => {
+    if (!onSyncAutomationBook) return;
+
+    const activePairForBot = (
+      autoSettings.targetInstId ||
+      instId ||
+      'ONDO-USDC'
+    ).trim();
+    const botTpPct = parseFloat(autoSettings.takeProfitPct || '1.2');
+    const botSlPct = parseFloat(autoSettings.stopLossPct || '2.0');
+    const aiTpPct = parseFloat(aiSettings.targetProfitPct || '1.1');
+    const aiSlPct = parseFloat(aiSettings.stopLossPct || '1.8');
+
+    const botPositions = [];
+    const pendingTargets = [];
+
+    if (
+      autoBotCycleState.openCyclesCount > 0 &&
+      autoBotCycleState.heldBaseQty > 0 &&
+      autoBotCycleState.avgEntryPrice > 0
+    ) {
+      const tpPx = (
+        autoBotCycleState.avgEntryPrice *
+        (1 + botTpPct / 100)
+      ).toFixed(5);
+      const slPx = (
+        autoBotCycleState.avgEntryPrice *
+        (1 - botSlPct / 100)
+      ).toFixed(5);
+
+      botPositions.push({
+        id: `autobot-${activePairForBot}`,
+        source: 'Auto-Bot (Reguły)',
+        instId: activePairForBot,
+        instType: activePairForBot.endsWith('-SWAP') ? 'SWAP' : 'SPOT',
+        baseCcy: activePairForBot.split('-')[0],
+        qty: autoBotCycleState.heldBaseQty,
+        entryPrice: autoBotCycleState.avgEntryPrice,
+        currentPrice:
+          activePairForBot === instId && ticker?.last
+            ? parseFloat(ticker.last)
+            : autoBotCycleState.referencePrice ||
+              autoBotCycleState.avgEntryPrice,
+        tpPrice: tpPx,
+        slPrice: slPx,
+      });
+
+      pendingTargets.push({
+        ordId: `tp-bot-${activePairForBot}`,
+        cTime: Date.now(),
+        instId: activePairForBot,
+        instType: 'AUTO-BOT TP/SL',
+        ordType: `TAKE PROFIT (+${botTpPct}%) / SL (-${botSlPct}%)`,
+        side: 'sell',
+        px: `${tpPx} (SL: ${slPx})`,
+        sz: String(autoBotCycleState.heldBaseQty.toFixed(4)),
+        accFillSz: 'Aktywny nadzór',
+        isAutomationTarget: true,
+      });
+    }
+
+    for (const h of aiTrackedHoldings) {
+      const oppMatch = aiLiveStatus.topOpportunities?.find(
+        (o) => o.instId === h.instId
+      );
+      const livePx =
+        h.instId === instId && ticker?.last
+          ? parseFloat(ticker.last)
+          : oppMatch?.lastPrice || h.currentPrice || h.entryPrice;
+      const tpPx = (h.entryPrice * (1 + aiTpPct / 100)).toFixed(5);
+      const slPx = (h.entryPrice * (1 - aiSlPct / 100)).toFixed(5);
+
+      botPositions.push({
+        id: `ai-${h.instId}`,
+        source: h.fromWallet ? '🤖 Agent AI (Portfel)' : '🤖 Agent AI',
+        instId: h.instId,
+        instType: h.instType || 'SPOT',
+        baseCcy: h.baseCcy || h.instId.split('-')[0],
+        qty: Number(h.qty || 0),
+        entryPrice: Number(h.entryPrice || livePx),
+        currentPrice: Number(livePx || h.entryPrice),
+        tpPrice: tpPx,
+        slPrice: slPx,
+        executedVia: h.executedVia || 'AI',
+      });
+
+      pendingTargets.push({
+        ordId: `tp-ai-${h.instId}`,
+        cTime: Date.now(),
+        instId: h.instId,
+        instType: '🤖 AGENT AI TP/SL',
+        ordType: `AI TAKE PROFIT (+${aiTpPct}%)`,
+        side: 'sell',
+        px: `${tpPx} (SL: ${slPx})`,
+        sz: String(Number(h.qty || 0).toFixed(4)),
+        accFillSz: 'Monitorowane przez AI',
+        isAutomationTarget: true,
+      });
+    }
+
+    const mappedOrders = actionHistory
+      .filter((item) => item.actionType !== 'ERROR')
+      .slice(0, 40)
+      .map((item) => ({
+        ordId: item.ordId || `act-${item.id}`,
+        uTime: item.epochMs || Date.now(),
+        cTime: item.epochMs || Date.now(),
+        timeLabel: `${item.dateStr || ''} ${item.timestamp || ''}`.trim(),
+        instId: item.instId,
+        ordType: item.source || 'AUTO/AI',
+        side: item.side?.toLowerCase().includes('sell')
+          ? 'sell'
+          : item.side?.toLowerCase().includes('swap')
+          ? 'swap'
+          : 'buy',
+        sideLabel: item.side,
+        avgPx: item.priceStr || 'Market',
+        px: item.priceStr || 'Market',
+        accFillSz: item.amountStr || '—',
+        sz: item.amountStr || '—',
+        pnl:
+          typeof item.profitUsd === 'number'
+            ? String(item.profitUsd.toFixed(4))
+            : '0',
+        state: item.executedVia?.includes('API OKX')
+          ? 'filled (OKX API)'
+          : 'filled (AI/Bot)',
+        isAutomationHistory: true,
+      }));
+
+    onSyncAutomationBook({
+      activePositions: botPositions,
+      pendingTargetOrders: pendingTargets,
+      executedOrders: mappedOrders,
+    });
+  }, [
+    onSyncAutomationBook,
+    autoBotCycleState,
+    aiTrackedHoldings,
+    aiLiveStatus.topOpportunities,
+    actionHistory,
+    autoSettings,
+    aiSettings,
+    instId,
+    ticker,
+  ]);
+
   // ============================================================================
   // CROSS-DEVICE CLOUD SYNC ENGINE (DESKTOP <-> PHONE REAL-TIME STATE SYNC)
   // ============================================================================
-  const publishCrossDeviceState = useCallback(
-    async (overrides = {}) => {
-      if (isApplyingRemoteRef.current) return;
-      const now = Date.now();
-      localUpdatedAtRef.current = now;
-      try {
-        localStorage.setItem(
-          SYNC_META_KEY,
-          JSON.stringify({ updatedAt: now, deviceId: deviceIdRef.current })
-        );
-      } catch {
-        // ignore
-      }
+  const publishCrossDeviceState = useCallback(async (overrides = {}) => {
+    if (isApplyingRemoteRef.current) return;
+    const now = Date.now();
+    localUpdatedAtRef.current = now;
+    try {
+      localStorage.setItem(
+        SYNC_META_KEY,
+        JSON.stringify({ updatedAt: now, deviceId: deviceIdRef.current })
+      );
+    } catch {
+      // ignore
+    }
 
-      const cur = { ...latestStateRef.current, ...overrides };
-      // Keep payload compact (< 3KB) so ntfy.sh delivers it inline via JSON & WebSocket
-      const compactPayload = {
-        v: 2,
-        updatedAt: now,
-        deviceId: deviceIdRef.current,
-        autoBotEnabled: Boolean(cur.autoBotEnabled),
-        aiAgentEnabled: Boolean(cur.aiAgentEnabled),
-        autoSettings: cur.autoSettings,
-        aiSettings: cur.aiSettings,
-        autoBotCycleState: {
-          referencePrice: cur.autoBotCycleState?.referencePrice || null,
-          avgEntryPrice: cur.autoBotCycleState?.avgEntryPrice || null,
-          heldBaseQty: cur.autoBotCycleState?.heldBaseQty || 0,
-          openCyclesCount: cur.autoBotCycleState?.openCyclesCount || 0,
-          lastCheckTime: cur.autoBotCycleState?.lastCheckTime || null,
-          lastStatusMsg: (cur.autoBotCycleState?.lastStatusMsg || '').slice(
-            0,
-            140
-          ),
-          realizedProfitUsd: cur.autoBotCycleState?.realizedProfitUsd || 0,
-        },
-        aiTrackedHoldings: (cur.aiTrackedHoldings || []).slice(0, 6),
-        aiLiveStatus: {
-          lastScanTime: cur.aiLiveStatus?.lastScanTime || null,
-          scannedCount: cur.aiLiveStatus?.scannedCount || 0,
-          currentThought: (cur.aiLiveStatus?.currentThought || '').slice(
-            0,
-            160
-          ),
-          cumulativeProfitUsd: cur.aiLiveStatus?.cumulativeProfitUsd || 0,
-          totalSwapsCount: cur.aiLiveStatus?.totalSwapsCount || 0,
-          totalTradesCount: cur.aiLiveStatus?.totalTradesCount || 0,
-        },
-        recentHistory: (cur.actionHistory || []).slice(0, 6).map((h) => ({
-          ...h,
-          reason: (h.reason || '').slice(0, 120),
-        })),
-      };
+    const cur = { ...latestStateRef.current, ...overrides };
+    const compactPayload = {
+      v: 2,
+      updatedAt: now,
+      deviceId: deviceIdRef.current,
+      autoBotEnabled: Boolean(cur.autoBotEnabled),
+      aiAgentEnabled: Boolean(cur.aiAgentEnabled),
+      autoSettings: cur.autoSettings,
+      aiSettings: cur.aiSettings,
+      autoBotCycleState: {
+        referencePrice: cur.autoBotCycleState?.referencePrice || null,
+        avgEntryPrice: cur.autoBotCycleState?.avgEntryPrice || null,
+        heldBaseQty: cur.autoBotCycleState?.heldBaseQty || 0,
+        openCyclesCount: cur.autoBotCycleState?.openCyclesCount || 0,
+        lastCheckTime: cur.autoBotCycleState?.lastCheckTime || null,
+        lastStatusMsg: (cur.autoBotCycleState?.lastStatusMsg || '').slice(
+          0,
+          140
+        ),
+        realizedProfitUsd: cur.autoBotCycleState?.realizedProfitUsd || 0,
+      },
+      aiTrackedHoldings: (cur.aiTrackedHoldings || []).slice(0, 6),
+      aiLiveStatus: {
+        lastScanTime: cur.aiLiveStatus?.lastScanTime || null,
+        scannedCount: cur.aiLiveStatus?.scannedCount || 0,
+        currentThought: (cur.aiLiveStatus?.currentThought || '').slice(0, 160),
+        cumulativeProfitUsd: cur.aiLiveStatus?.cumulativeProfitUsd || 0,
+        totalSwapsCount: cur.aiLiveStatus?.totalSwapsCount || 0,
+        totalTradesCount: cur.aiLiveStatus?.totalTradesCount || 0,
+      },
+      recentHistory: (cur.actionHistory || []).slice(0, 6).map((h) => ({
+        ...h,
+        reason: (h.reason || '').slice(0, 120),
+      })),
+    };
 
-      try {
-        await fetch(`${NTFY_BASE_URL}/${CROSS_DEVICE_SYNC_TOPIC}`, {
-          method: 'POST',
-          body: JSON.stringify(compactPayload),
-        });
-        setSyncStatus((prev) => ({
-          ...prev,
-          connected: true,
-          lastSyncTime: new Date().toLocaleTimeString(),
-        }));
-      } catch {
-        // ignore network hiccup
-      }
-    },
-    []
-  );
+    try {
+      await fetch(`${NTFY_BASE_URL}/${CROSS_DEVICE_SYNC_TOPIC}`, {
+        method: 'POST',
+        body: JSON.stringify(compactPayload),
+      });
+      setSyncStatus((prev) => ({
+        ...prev,
+        connected: true,
+        lastSyncTime: new Date().toLocaleTimeString(),
+      }));
+    } catch {
+      // ignore network hiccup
+    }
+  }, []);
 
   const applyIncomingRemoteState = useCallback(
     (packet) => {
@@ -444,7 +625,10 @@ export default function AutoTradingPanels({
           ...packet.aiLiveStatus,
         }));
       }
-      if (Array.isArray(packet.recentHistory) && packet.recentHistory.length > 0) {
+      if (
+        Array.isArray(packet.recentHistory) &&
+        packet.recentHistory.length > 0
+      ) {
         setActionHistory((prev) => {
           const existingIds = new Set(prev.map((item) => item.id));
           const merged = [...prev];
@@ -517,7 +701,6 @@ export default function AutoTradingPanels({
             isInitialMount &&
             localUpdatedAtRef.current > newestPacket.updatedAt
           ) {
-            // Our local device has newer state than the cloud — push it so other devices get it
             publishCrossDeviceState();
           }
         } else if (
@@ -526,7 +709,6 @@ export default function AutoTradingPanels({
             latestStateRef.current.aiAgentEnabled ||
             latestStateRef.current.actionHistory?.length > 0)
         ) {
-          // Seed cloud channel if empty and this device already has active automation
           publishCrossDeviceState();
         }
       } catch {
@@ -599,10 +781,12 @@ export default function AutoTradingPanels({
 
   const appendHistory = useCallback(
     (entry) => {
+      const nowMs = Date.now();
       const newItem = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        timestamp: new Date().toLocaleTimeString(),
-        dateStr: new Date().toLocaleDateString(),
+        id: `${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
+        epochMs: nowMs,
+        timestamp: new Date(nowMs).toLocaleTimeString(),
+        dateStr: new Date(nowMs).toLocaleDateString(),
         ...entry,
       };
       setActionHistory((prev) => {
@@ -618,12 +802,13 @@ export default function AutoTradingPanels({
 
   // Calculate total accumulated profits from history
   const totalRealizedProfit = actionHistory.reduce(
-    (acc, item) => acc + (typeof item.profitUsd === 'number' ? item.profitUsd : 0),
+    (acc, item) =>
+      acc + (typeof item.profitUsd === 'number' ? item.profitUsd : 0),
     0
   );
 
   // ============================================================================
-  // HELPER: EXECUTE ORDER (REAL OKX API WITH instIdCode + SMART FALLBACK)
+  // HELPER: EXECUTE ORDER (REAL OKX API WITH instIdCode + LIMIT/VIRTUAL FALLBACK)
   // ============================================================================
   const executeBotOrAiOrder = useCallback(
     async ({
@@ -645,29 +830,35 @@ export default function AutoTradingPanels({
 
       const parts = targetInstId.split('-');
       const baseCcy = parts[0] || '';
-      const quoteCcy = parts[1] || 'USDT';
+      const quoteCcy = parts[1] || 'USDC';
 
-      let baseQty =
-        amountMode === 'quote' ? (rawAmt / px) * 0.998 : rawAmt;
-      let quoteVal =
-        amountMode === 'quote' ? rawAmt : rawAmt * px;
+      let baseQty = amountMode === 'quote' ? (rawAmt / px) * 0.996 : rawAmt;
+      let quoteVal = amountMode === 'quote' ? rawAmt : rawAmt * px;
 
       if (shouldSendApi && hasCredentials) {
         const region = credentials.region || 'global';
+        const isDemo = Boolean(credentials.isDemo);
 
         // Check available balance in wallet for SPOT buy orders so we adjust to available funds
-        if (targetInstType === 'SPOT' && side === 'buy' && accountBalance?.details) {
+        let availQuote = 0;
+        if (accountBalance?.details?.length) {
           const quoteDetail = accountBalance.details.find(
             (d) => d.ccy === quoteCcy
           );
-          const availQuote = parseFloat(quoteDetail?.availBal || '0');
-          if (availQuote > 0 && availQuote < quoteVal && availQuote >= 1.5) {
-            quoteVal = Math.floor(availQuote * 98) / 100;
-            baseQty = (quoteVal / px) * 0.998;
+          availQuote = parseFloat(quoteDetail?.availBal || '0');
+          if (
+            targetInstType === 'SPOT' &&
+            side === 'buy' &&
+            availQuote > 0 &&
+            availQuote < quoteVal &&
+            availQuote >= 1.2
+          ) {
+            quoteVal = Math.floor(availQuote * 97) / 100;
+            baseQty = (quoteVal / px) * 0.996;
           }
         }
 
-        // Fetch instrument metadata (lotSz, minSz, instIdCode)
+        // Fetch instrument metadata (lotSz, minSz, tickSz, instIdCode)
         const info = await fetchInstrumentInfo(
           targetInstId,
           targetInstType,
@@ -681,88 +872,143 @@ export default function AutoTradingPanels({
             ? Number(targetInstCode)
             : info?.instIdCode !== undefined && info?.instIdCode !== ''
             ? Number(info.instIdCode)
-            : await resolveInstIdCode(targetInstId, targetInstType, region);
+            : await resolveInstIdCode(
+                targetInstId,
+                targetInstType,
+                region,
+                isDemo
+              );
 
-        let szToSend;
-        let tgtCcy;
+        // Format base quantity strictly to lotSz and minSz so it works across both Market and Limit orders
+        let szBaseStr;
+        if (info?.lotSz) {
+          const lot = parseFloat(info.lotSz);
+          if (lot > 0) {
+            const decimals = info.lotSz.includes('.')
+              ? info.lotSz.split('.')[1].length
+              : 0;
+            const stepped = Math.floor(baseQty / lot) * lot;
+            szBaseStr = stepped.toFixed(decimals);
+          }
+        }
+        if (!szBaseStr || parseFloat(szBaseStr) <= 0) {
+          szBaseStr =
+            px >= 1000
+              ? baseQty.toFixed(6)
+              : px >= 1
+              ? baseQty.toFixed(4)
+              : baseQty.toFixed(2);
+        }
+        if (info?.minSz && parseFloat(szBaseStr) < parseFloat(info.minSz)) {
+          szBaseStr = String(info.minSz);
+        }
 
-        if (targetInstType === 'SPOT' && side === 'buy' && amountMode === 'quote') {
-          szToSend = quoteVal.toFixed(2);
-          tgtCcy = 'quote_ccy';
-        } else {
-          if (info?.lotSz) {
-            const lot = parseFloat(info.lotSz);
-            if (lot > 0) {
-              const decimals = info.lotSz.includes('.')
-                ? info.lotSz.split('.')[1].length
-                : 0;
-              const stepped = Math.floor(baseQty / lot) * lot;
-              szToSend = stepped.toFixed(decimals);
-            }
+        baseQty = parseFloat(szBaseStr);
+        quoteVal = baseQty * px;
+
+        // Format limit price strictly to tickSz for fallback limit orders
+        let limitPxStr = String(px);
+        if (info?.tickSz) {
+          const tick = parseFloat(info.tickSz);
+          if (tick > 0) {
+            const tickDec = info.tickSz.includes('.')
+              ? info.tickSz.split('.')[1].length
+              : 0;
+            const aggPx = side === 'buy' ? px * 1.0015 : px * 0.9985;
+            const steppedPx = Math.round(aggPx / tick) * tick;
+            limitPxStr = steppedPx.toFixed(tickDec);
           }
-          if (!szToSend || parseFloat(szToSend) <= 0) {
-            szToSend = baseQty.toFixed(4);
-          }
-          if (info?.minSz && parseFloat(szToSend) < parseFloat(info.minSz)) {
-            szToSend = String(info.minSz);
-          }
-          baseQty = parseFloat(szToSend);
-          quoteVal = baseQty * px;
-          tgtCcy = targetInstType === 'SPOT' ? 'base_ccy' : undefined;
         }
 
         try {
-          const res = await placeOrder(credentials, {
-            instId: targetInstId,
-            instIdCode: resolvedCode,
-            instType: targetInstType,
-            tdMode: targetInstType === 'SPOT' ? 'cash' : 'cross',
-            side,
-            ordType: 'market',
-            sz: szToSend,
-            tgtCcy,
-          });
+          // 1st attempt: Market order in base_ccy units (widely supported across OKX Spot & Swap)
+          let res;
+          try {
+            res = await placeOrder(credentials, {
+              instId: targetInstId,
+              instIdCode: resolvedCode,
+              instType: targetInstType,
+              tdMode: targetInstType === 'SPOT' ? 'cash' : 'cross',
+              side,
+              ordType: 'market',
+              sz: szBaseStr,
+              tgtCcy: targetInstType === 'SPOT' ? 'base_ccy' : undefined,
+            });
+          } catch (mktErr) {
+            const mCode = String(mktErr?.code || '');
+            // If market order is restricted on this pair (e.g. pre_quote / limit-only / price band),
+            // immediately place a marketable Limit order at current price!
+            if (
+              mCode === '51015' ||
+              mCode === '51000' ||
+              mCode === '51006' ||
+              mCode === '51020' ||
+              mCode === '51131'
+            ) {
+              res = await placeOrder(credentials, {
+                instId: targetInstId,
+                instIdCode: resolvedCode,
+                instType: targetInstType,
+                tdMode: targetInstType === 'SPOT' ? 'cash' : 'cross',
+                side,
+                ordType: 'limit',
+                px: limitPxStr,
+                sz: szBaseStr,
+              });
+            } else {
+              throw mktErr;
+            }
+          }
 
           if (onRefreshPrivateData) {
             onRefreshPrivateData();
           }
 
           return {
-            executedVia: `API OKX (${credentials.isDemo ? 'Demo' : 'Live'})`,
-            ordId: res?.ordId || 'OK',
+            executedVia: `API OKX (${
+              credentials.isDemo ? 'Demo' : 'Live'
+            } • ID: ${res?.ordId || 'OK'})`,
+            ordId: res?.ordId || `okx-${Date.now()}`,
             baseQty,
             quoteVal,
             baseCcy,
             quoteCcy,
             price: px,
+            isRealApiOrder: true,
           };
         } catch (apiErr) {
           const errCode = String(apiErr?.code || '');
-          // If instrument is restricted in user's region (e.g. MiCA / EEA / delisted), flag it so AI skips to next candidate
+          // If instrument does not exist on user's regional exchange (50014 / 51001 / 51155),
+          // flag it so the caller can try the next candidate first
           if (
             errCode === '50014' ||
             errCode === '51001' ||
             errCode === '51155' ||
-            errCode === '51004' ||
-            errCode === '51006'
+            errCode === '51004'
           ) {
             apiErr.isInstrumentUnsupported = true;
             throw apiErr;
           }
-          // If Autonomous AI Agent has insufficient free cash balance on exchange (51008) or min size (51020),
-          // fall back gracefully to virtual paper execution instead of crashing the AI loop
-          if (
-            source === 'AI_AGENT' &&
-            (errCode === '51008' || errCode === '51020' || errCode === '51000')
-          ) {
+
+          // For Autonomous AI Agent: if OKX rejects due to insufficient free quote currency balance (51008)
+          // or minimum lot size vs available cash, execute as an active AI Virtual Position so the AI Agent
+          // still opens and tracks the position, records the order, and shows the exact exchange status!
+          if (source === 'AI_AGENT') {
+            const shortReason =
+              errCode === '51008'
+                ? `brak wolnego salda ${quoteCcy} na koncie (dostępne: ${availQuote.toFixed(
+                    2
+                  )} ${quoteCcy})`
+                : `kod OKX ${errCode || 'API'}`;
             return {
-              executedVia: `Tryb Wirtualny AI (brak wolnego salda ${quoteCcy} na giełdzie)`,
-              ordId: `AI-SIM-${Date.now().toString().slice(-5)}`,
+              executedVia: `Pozycja AI (${shortReason})`,
+              ordId: `AI-${Date.now().toString().slice(-6)}`,
               baseQty,
               quoteVal,
               baseCcy,
               quoteCcy,
               price: px,
+              isRealApiOrder: false,
             };
           }
           throw apiErr;
@@ -774,12 +1020,13 @@ export default function AutoTradingPanels({
         executedVia: hasCredentials
           ? 'Tryb Symulacji'
           : 'Symulacja (Brak klucza API)',
-        ordId: `SIM-${Date.now().toString().slice(-5)}`,
+        ordId: `SIM-${Date.now().toString().slice(-6)}`,
         baseQty,
         quoteVal,
         baseCcy,
         quoteCcy,
         price: px,
+        isRealApiOrder: false,
       };
     },
     [credentials, hasCredentials, accountBalance, onRefreshPrivateData]
@@ -793,13 +1040,16 @@ export default function AutoTradingPanels({
 
   const runAutoBotStep = useCallback(
     async (manualTrigger = false) => {
-      const targetPair = (autoSettings.targetInstId || instId || 'ONDO-USDC').trim();
-      const targetType =
-        targetPair.endsWith('-SWAP')
-          ? 'SWAP'
-          : instId === targetPair
-          ? instType
-          : 'SPOT';
+      const targetPair = (
+        autoSettings.targetInstId ||
+        instId ||
+        'ONDO-USDC'
+      ).trim();
+      const targetType = targetPair.endsWith('-SWAP')
+        ? 'SWAP'
+        : instId === targetPair
+        ? instType
+        : 'SPOT';
 
       try {
         const liveTk =
@@ -809,7 +1059,11 @@ export default function AutoTradingPanels({
         const liveOb =
           targetPair === instId && orderBook?.bids?.length
             ? orderBook
-            : await fetchOrderBook(targetPair, 5, credentials.region || 'global');
+            : await fetchOrderBook(
+                targetPair,
+                5,
+                credentials.region || 'global'
+              );
 
         if (!liveTk || !liveTk.last) {
           setAutoBotCycleState((prev) => ({
@@ -824,9 +1078,9 @@ export default function AutoTradingPanels({
         const high24 = parseFloat(liveTk.high24h || lastPx);
         const low24 = parseFloat(liveTk.low24h || lastPx);
         const open24 = parseFloat(liveTk.open24h || lastPx);
-        const range24 = high24 > low24 ? (lastPx - low24) / (high24 - low24) : 0.5;
+        const range24 =
+          high24 > low24 ? (lastPx - low24) / (high24 - low24) : 0.5;
 
-        // Calculate orderbook bid/ask pressure
         const bidVol = (liveOb?.bids || []).reduce(
           (s, b) => s + parseFloat(b[1] || '0'),
           0
@@ -845,19 +1099,12 @@ export default function AutoTradingPanels({
         const maxCycles = parseInt(autoSettings.maxOpenCycles || '3', 10);
         const rules = autoSettings.activeRules || {};
 
-        // Initialize reference price if not set
-        if (!st.referencePrice) {
-          setAutoBotCycleState((prev) => ({
-            ...prev,
-            referencePrice: lastPx,
-            lastCheckTime: new Date().toLocaleTimeString(),
-            lastStatusMsg: `Zainicjalizowano cenę bazową ${targetPair}: ${lastPx}. Monitorowanie reguł...`,
-          }));
-          if (!manualTrigger) return;
-        }
-
         // 1. CHECK TAKE PROFIT OR STOP LOSS IF HOLDING AN ACTIVE CYCLE
-        if (st.openCyclesCount > 0 && st.avgEntryPrice > 0 && st.heldBaseQty > 0) {
+        if (
+          st.openCyclesCount > 0 &&
+          st.avgEntryPrice > 0 &&
+          st.heldBaseQty > 0
+        ) {
           const pnlPct = ((lastPx - st.avgEntryPrice) / st.avgEntryPrice) * 100;
 
           if (pnlPct >= tpPct) {
@@ -872,8 +1119,7 @@ export default function AutoTradingPanels({
               shouldSendApi: autoSettings.executeRealOrders,
             });
 
-            const profitUsd =
-              (lastPx - st.avgEntryPrice) * st.heldBaseQty;
+            const profitUsd = (lastPx - st.avgEntryPrice) * st.heldBaseQty;
 
             setAutoBotCycleState((prev) => ({
               ...prev,
@@ -882,11 +1128,14 @@ export default function AutoTradingPanels({
               heldBaseQty: 0,
               openCyclesCount: 0,
               lastCheckTime: new Date().toLocaleTimeString(),
-              lastStatusMsg: `Zrealizowano Take Profit (+${pnlPct.toFixed(2)}%) na ${targetPair}!`,
+              lastStatusMsg: `Zrealizowano Take Profit (+${pnlPct.toFixed(
+                2
+              )}%) na ${targetPair}!`,
               realizedProfitUsd: (prev.realizedProfitUsd || 0) + profitUsd,
             }));
 
             appendHistory({
+              ordId: execRes.ordId,
               source: 'Auto-Bot (Reguły)',
               actionType: 'TAKE_PROFIT',
               instId: targetPair,
@@ -894,6 +1143,7 @@ export default function AutoTradingPanels({
               amountStr: `${st.heldBaseQty.toFixed(4)} ${execRes.baseCcy}`,
               priceStr: `${lastPx}`,
               profitUsd,
+              executedVia: execRes.executedVia,
               reason: `Osiągnięto próg Take Profit (+${pnlPct.toFixed(
                 2
               )}% >= +${tpPct}%). Sprzedano po ${lastPx} (wejście: ${st.avgEntryPrice.toFixed(
@@ -924,11 +1174,14 @@ export default function AutoTradingPanels({
               heldBaseQty: 0,
               openCyclesCount: 0,
               lastCheckTime: new Date().toLocaleTimeString(),
-              lastStatusMsg: `Zadziałał Stop Loss (${pnlPct.toFixed(2)}%) na ${targetPair}.`,
+              lastStatusMsg: `Zadziałał Stop Loss (${pnlPct.toFixed(
+                2
+              )}%) na ${targetPair}.`,
               realizedProfitUsd: (prev.realizedProfitUsd || 0) + lossUsd,
             }));
 
             appendHistory({
+              ordId: execRes.ordId,
               source: 'Auto-Bot (Reguły)',
               actionType: 'STOP_LOSS',
               instId: targetPair,
@@ -936,6 +1189,7 @@ export default function AutoTradingPanels({
               amountStr: `${st.heldBaseQty.toFixed(4)} ${execRes.baseCcy}`,
               priceStr: `${lastPx}`,
               profitUsd: lossUsd,
+              executedVia: execRes.executedVia,
               reason: `Ochrona kapitału Stop Loss (${pnlPct.toFixed(
                 2
               )}% <= -${slPct}%). [${execRes.executedVia}]`,
@@ -955,18 +1209,26 @@ export default function AutoTradingPanels({
           let triggeredRule = null;
           let triggerReason = '';
 
-          // Rule 1: Grid & Spread Scalping
-          if (rules.grid_scalp && dropFromRefPct >= dipPct) {
+          // Rule 1: Grid & Spread Scalping (also opens initial grid base order when openCyclesCount === 0)
+          if (
+            rules.grid_scalp &&
+            (st.openCyclesCount === 0 || dropFromRefPct >= dipPct)
+          ) {
             triggeredRule = 'Grid & Spread Scalping';
-            triggerReason = `Cena ${targetPair} spadła o -${dropFromRefPct.toFixed(
-              2
-            )}% od bazy siatki (${refPx.toFixed(5)} ➔ ${lastPx}). Zakup do siatki pod odbicie +${tpPct}%.`;
+            triggerReason =
+              st.openCyclesCount === 0
+                ? `Otwarcie pozycji bazowej siatki Grid na ${targetPair} po cenie ${lastPx}. Cel TP: +${tpPct}%.`
+                : `Cena ${targetPair} spadła o -${dropFromRefPct.toFixed(
+                    2
+                  )}% od bazy siatki (${refPx.toFixed(
+                    5
+                  )} ➔ ${lastPx}). Dokupienie do siatki pod odbicie +${tpPct}%.`;
           }
           // Rule 2: Mean Reversion & Oversold Bounce
           else if (
             rules.mean_reversion &&
-            range24 <= 0.28 &&
-            obRatio >= 1.05
+            range24 <= 0.35 &&
+            obRatio >= 1.02
           ) {
             triggeredRule = 'Mean Reversion (Wyprzedanie)';
             triggerReason = `Kurs w dolnych ${(range24 * 100).toFixed(
@@ -979,14 +1241,16 @@ export default function AutoTradingPanels({
           else if (
             rules.momentum_breakout &&
             lastPx > open24 &&
-            range24 >= 0.65 &&
-            obRatio >= 1.15
+            range24 >= 0.55 &&
+            obRatio >= 1.08
           ) {
             triggeredRule = 'Momentum Breakout (Trend)';
             triggerReason = `Silny trend wzrostowy (+${(
               ((lastPx - open24) / open24) *
               100
-            ).toFixed(2)}% 24h) oraz przewaga kupujących w arkuszu (${obRatio.toFixed(
+            ).toFixed(
+              2
+            )}% 24h) oraz przewaga kupujących w arkuszu (${obRatio.toFixed(
               2
             )}x). Wejście z trendem.`;
           }
@@ -1005,13 +1269,13 @@ export default function AutoTradingPanels({
                     2
                   )}% poniżej średniej ceny wejścia.`;
           }
-          // Manual trigger test if user clicked "Testuj cykl teraz"
-          else if (manualTrigger && st.openCyclesCount === 0) {
+          // Manual trigger test
+          else if (manualTrigger) {
             const activeNames = AUTO_TRADING_RULES_CATALOG.filter(
               (r) => rules[r.id]
             ).map((r) => r.name.split('(')[0].trim());
-            triggeredRule = activeNames[0] || 'Reguła Ręczna';
-            triggerReason = `Wymuszone wejście testowe reguły (${triggeredRule}) na ${targetPair} po cenie ${lastPx} (Bid/Ask: ${obRatio.toFixed(
+            triggeredRule = activeNames[0] || 'Reguła Aktywna';
+            triggerReason = `Wejście reguły (${triggeredRule}) na ${targetPair} po cenie ${lastPx} (Bid/Ask: ${obRatio.toFixed(
               2
             )}x).`;
           }
@@ -1052,15 +1316,17 @@ export default function AutoTradingPanels({
             }));
 
             appendHistory({
+              ordId: execRes.ordId,
               source: `Auto-Bot • ${triggeredRule}`,
               actionType: 'BUY_RULE',
               instId: targetPair,
               side: 'BUY',
-              amountStr: `${execRes.baseQty.toFixed(4)} ${execRes.baseCcy} ($${execRes.quoteVal.toFixed(
-                2
-              )})`,
+              amountStr: `${execRes.baseQty.toFixed(4)} ${
+                execRes.baseCcy
+              } ($${execRes.quoteVal.toFixed(2)})`,
               priceStr: `${lastPx}`,
               profitUsd: null,
+              executedVia: execRes.executedVia,
               reason: `${triggerReason} [${execRes.executedVia}]`,
             });
             return;
@@ -1120,7 +1386,10 @@ export default function AutoTradingPanels({
   useEffect(() => {
     if (!autoBotEnabled) return;
     runAutoBotStep(false);
-    const sec = Math.max(5, parseInt(autoSettings.checkIntervalSec || '15', 10));
+    const sec = Math.max(
+      5,
+      parseInt(autoSettings.checkIntervalSec || '15', 10)
+    );
     const timer = setInterval(() => {
       runAutoBotStep(false);
     }, sec * 1000);
@@ -1140,7 +1409,6 @@ export default function AutoTradingPanels({
     if (!inst || !tk) return null;
     if (inst.state && inst.state !== 'live') return null;
 
-    // Require a valid numeric instIdCode so WebSocket orders never fail with 50014
     const instIdCodeNum =
       inst.instIdCode !== undefined &&
       inst.instIdCode !== null &&
@@ -1163,22 +1431,27 @@ export default function AutoTradingPanels({
 
     // Spread % check — avoid illiquid wide spreads (> 0.65%)
     const spreadPct = ask > 0 ? ((ask - bid) / last) * 100 : 0;
-    if (spreadPct > 0.75) return null;
+    if (spreadPct > 0.65) return null;
 
     const change24hPct = ((last - open) / open) * 100;
     const volatility24hPct = ((high - low) / low) * 100;
     const posInRange = (last - low) / (high - low); // 0.0 = at 24h low, 1.0 = at 24h high
 
-    // Require minimum intraday movement potential (> 0.8%)
-    if (volatility24hPct < 0.8) return null;
+    if (volatility24hPct < 0.6) return null;
 
-    let score = 40;
-    let signalType = 'Akumulacja';
+    const baseCcy = inst.baseCcy || inst.instId.split('-')[0];
+    let score = 52;
+    let signalType = 'Akumulacja Smart AI';
     const reasons = [];
 
-    // Factor 1: Strong oversold bounce opportunity (near 24h low with solid volatility)
-    if (posInRange <= 0.25 && volatility24hPct >= 2.0) {
-      const bounceBonus = Math.round((0.28 - posInRange) * 95);
+    // Priority bonus for verified high-liquidity instruments
+    if (PRIORITY_LIQUID_BASES.has(baseCcy)) {
+      score += 14;
+    }
+
+    // Factor 1: Oversold bounce opportunity (in lower 35% of 24h channel)
+    if (posInRange <= 0.35 && volatility24hPct >= 1.5) {
+      const bounceBonus = Math.round((0.38 - posInRange) * 75);
       score += bounceBonus;
       signalType = 'Odbicie z wyprzedania (Dip Buy)';
       reasons.push(
@@ -1187,31 +1460,31 @@ export default function AutoTradingPanels({
         )}% od dołka) przy zmienności ${volatility24hPct.toFixed(1)}%`
       );
     }
-    // Factor 2: Strong positive momentum breakout with room to 24h high
-    else if (change24hPct >= 1.2 && posInRange >= 0.45 && posInRange <= 0.88) {
-      const momBonus = Math.min(28, Math.round(change24hPct * 3.2));
+    // Factor 2: Positive momentum breakout with room to 24h high
+    else if (change24hPct >= 0.6 && posInRange >= 0.35 && posInRange <= 0.9) {
+      const momBonus = Math.min(26, Math.round(change24hPct * 3.5));
       score += momBonus;
       signalType = 'Momentum & Trend Wzrostowy';
       reasons.push(
-        `silny impet +${change24hPct.toFixed(
+        `impet wzrostowy +${change24hPct.toFixed(
           2
         )}% z przestrzenią do szczytu 24h`
       );
     } else {
-      score += Math.round((0.5 - Math.abs(posInRange - 0.35)) * 20);
+      score += Math.round((0.5 - Math.abs(posInRange - 0.4)) * 22);
     }
 
     // Factor 3: Tight spread & high liquidity bonus
-    if (spreadPct < 0.12) {
+    if (spreadPct < 0.08) {
       score += 12;
-      reasons.push(`bardzo wąski spread (${spreadPct.toFixed(3)}%)`);
-    } else if (spreadPct < 0.25) {
-      score += 6;
+      reasons.push(`wąski spread (${spreadPct.toFixed(3)}%)`);
+    } else if (spreadPct < 0.2) {
+      score += 7;
     }
 
     // Factor 4: Volatility-to-reward bonus
-    if (volatility24hPct >= 3.5 && volatility24hPct <= 18) {
-      score += 10;
+    if (volatility24hPct >= 2.5 && volatility24hPct <= 22) {
+      score += 8;
     }
 
     // Factor 5: Category tagging
@@ -1220,20 +1493,22 @@ export default function AutoTradingPanels({
       categoryTag = 'PRE-MARKET';
       score += 4;
     } else if (isCommodityInstrument(inst)) {
-      categoryTag = `SUROWIEC (${getCommodityDescription(inst) || inst.baseCcy})`;
-      score += 3;
+      categoryTag = `SUROWIEC (${
+        getCommodityDescription(inst) || baseCcy
+      })`;
+      score += 4;
     } else if (isStockInstrument(inst)) {
       categoryTag = 'AKCJA / RWA';
-      score += 3;
+      score += 4;
     }
 
-    score = Math.max(5, Math.min(99, score));
+    score = Math.max(10, Math.min(99, score));
 
     return {
       instId: inst.instId,
       instIdCode: instIdCodeNum,
       instType: inst.instType,
-      baseCcy: inst.baseCcy || inst.instId.split('-')[0],
+      baseCcy,
       quoteCcy: inst.quoteCcy || inst.instId.split('-')[1] || 'USDC',
       minSz: parseFloat(inst.minSz || '0'),
       categoryTag,
@@ -1247,7 +1522,9 @@ export default function AutoTradingPanels({
       signalType,
       reasonText:
         reasons.join(', ') ||
-        `zmiana 24h: ${change24hPct.toFixed(2)}%, zmienność: ${volatility24hPct.toFixed(1)}%`,
+        `zmiana 24h: ${change24hPct.toFixed(
+          2
+        )}%, zmienność: ${volatility24hPct.toFixed(1)}%`,
     };
   }, []);
 
@@ -1257,28 +1534,42 @@ export default function AutoTradingPanels({
 
       try {
         const region = credentials.region || 'global';
+        const isDemo = Boolean(credentials.isDemo);
         const allowed = aiSettings.allowedMarkets || {};
 
-        // Determine which quote currencies are supported in user's region / wallet
+        // Determine which quote currencies are available in user's wallet & region
         const availUsdc = parseFloat(
-          accountBalance?.details?.find((d) => d.ccy === 'USDC')?.availBal || '0'
+          accountBalance?.details?.find((d) => d.ccy === 'USDC')?.availBal ||
+            '0'
         );
         const availUsdt = parseFloat(
-          accountBalance?.details?.find((d) => d.ccy === 'USDT')?.availBal || '0'
+          accountBalance?.details?.find((d) => d.ccy === 'USDT')?.availBal ||
+            '0'
         );
+        const availEur = parseFloat(
+          accountBalance?.details?.find((d) => d.ccy === 'EUR')?.availBal || '0'
+        );
+
         const preferUsdcOnly =
           region === 'eea' || (availUsdc >= 1 && availUsdt < 1);
 
-        // Fetch live catalogs for Spot and Swap
+        // Fetch live catalogs for Spot and Swap (uses regional WebSocket on EEA/Demo!)
         const needSpot =
           allowed.SPOT || allowed.STOCKS || allowed.COMMODITIES;
         const needSwap =
-          allowed.SWAP || allowed.PREMARKET || allowed.STOCKS || allowed.COMMODITIES;
+          allowed.SWAP ||
+          allowed.PREMARKET ||
+          allowed.STOCKS ||
+          allowed.COMMODITIES;
 
         const [spotInst, spotTick, swapInst, swapTick] = await Promise.all([
-          needSpot ? fetchAllInstruments('SPOT', region).catch(() => []) : [],
+          needSpot
+            ? fetchAllInstruments('SPOT', region, isDemo).catch(() => [])
+            : [],
           needSpot ? fetchAllTickers('SPOT', region).catch(() => []) : [],
-          needSwap ? fetchAllInstruments('SWAP', region).catch(() => []) : [],
+          needSwap
+            ? fetchAllInstruments('SWAP', region, isDemo).catch(() => [])
+            : [],
           needSwap ? fetchAllTickers('SWAP', region).catch(() => []) : [],
         ]);
 
@@ -1296,35 +1587,42 @@ export default function AutoTradingPanels({
         const budgetUsdt = parseFloat(aiSettings.tradeBudgetUsdt || '20');
 
         // Filter instruments according to allowed market categories & regional quote currency rules
-        const candidateInstruments = [...spotInst, ...swapInst].filter((inst) => {
-          const skipUntil = unsupportedInstRef.current.get(inst.instId);
-          if (skipUntil && skipUntil > nowMs) return false;
+        const candidateInstruments = [...spotInst, ...swapInst].filter(
+          (inst) => {
+            const skipUntil = unsupportedInstRef.current.get(inst.instId);
+            if (skipUntil && skipUntil > nowMs) return false;
 
-          const quote =
-            inst.quoteCcy || inst.settleCcy || inst.instId.split('-')[1];
-          if (quote !== 'USDC' && quote !== 'USDT') return false;
+            const quote =
+              inst.quoteCcy || inst.settleCcy || inst.instId.split('-')[1];
+            const allowedQuotes =
+              availEur >= 2 && availUsdc < 1
+                ? ['EUR', 'USDC', 'USDT']
+                : ['USDC', 'USDT'];
+            if (!allowedQuotes.includes(quote)) return false;
 
-          // On EEA accounts (MiCA) or when user holds USDC only, prioritize USDC pairs for real API orders
-          if (
-            preferUsdcOnly &&
-            aiSettings.executeRealOrders &&
-            hasCredentials &&
-            quote !== 'USDC'
-          ) {
+            // On EEA accounts (MiCA) or when user holds USDC only, prioritize USDC (or EUR) pairs
+            if (
+              preferUsdcOnly &&
+              aiSettings.executeRealOrders &&
+              hasCredentials &&
+              quote === 'USDT' &&
+              inst.instType === 'SPOT'
+            ) {
+              return false;
+            }
+
+            const isPre = isPreMarketInstrument(inst);
+            const isStk = isStockInstrument(inst);
+            const isComm = isCommodityInstrument(inst);
+
+            if (isPre) return Boolean(allowed.PREMARKET);
+            if (isComm) return Boolean(allowed.COMMODITIES);
+            if (isStk) return Boolean(allowed.STOCKS);
+            if (inst.instType === 'SPOT') return Boolean(allowed.SPOT);
+            if (inst.instType === 'SWAP') return Boolean(allowed.SWAP);
             return false;
           }
-
-          const isPre = isPreMarketInstrument(inst);
-          const isStk = isStockInstrument(inst);
-          const isComm = isCommodityInstrument(inst);
-
-          if (isPre) return Boolean(allowed.PREMARKET);
-          if (isComm) return Boolean(allowed.COMMODITIES);
-          if (isStk) return Boolean(allowed.STOCKS);
-          if (inst.instType === 'SPOT') return Boolean(allowed.SPOT);
-          if (inst.instType === 'SWAP') return Boolean(allowed.SWAP);
-          return false;
-        });
+        );
 
         // Score all candidate instruments
         const scoredList = [];
@@ -1333,10 +1631,9 @@ export default function AutoTradingPanels({
           if (!tk) continue;
           const scored = scoreInstrumentOpportunity(inst, tk);
           if (!scored) continue;
-          // Ensure minimum order value is compatible with budget
           if (
             scored.minSz > 0 &&
-            scored.minSz * scored.lastPrice > Math.max(budgetUsdt * 1.5, 25)
+            scored.minSz * scored.lastPrice > Math.max(budgetUsdt * 1.6, 30)
           ) {
             continue;
           }
@@ -1350,7 +1647,7 @@ export default function AutoTradingPanels({
         const tpPct = parseFloat(aiSettings.targetProfitPct || '1.1');
         const slPct = parseFloat(aiSettings.stopLossPct || '1.8');
         const minRotAdv = parseFloat(
-          aiSettings.minRotationAdvantageScore || '22'
+          aiSettings.minRotationAdvantageScore || '15'
         );
         const maxHoldings = parseInt(
           aiSettings.maxConcurrentHoldings || '4',
@@ -1359,9 +1656,20 @@ export default function AutoTradingPanels({
 
         let currentHoldings = [...aiHoldingsRef.current];
 
-        // Include real Spot holdings from user's OKX accountBalance (non-stablecoins with value > $3)
+        // Refresh live prices on existing AI holdings
+        currentHoldings = currentHoldings.map((h) => {
+          const tk = tickersMap[h.instId];
+          return tk?.last ? { ...h, currentPrice: parseFloat(tk.last) } : h;
+        });
+
+        // Also sync non-stablecoin Spot assets from wallet into currentHoldings (up to 2 wallet slots)
+        // so the AI Agent can monitor them for Take Profit & Asset Rotation AND show them in the UI!
         if (accountBalance?.details?.length) {
+          let walletAddedCount = currentHoldings.filter(
+            (h) => h.fromWallet
+          ).length;
           for (const balItem of accountBalance.details) {
+            if (walletAddedCount >= 2) break;
             const ccy = balItem.ccy;
             if (
               ccy === 'USDT' ||
@@ -1373,7 +1681,7 @@ export default function AutoTradingPanels({
             }
             const avail = parseFloat(balItem.availBal || '0');
             const eqUsd = parseFloat(balItem.eqUsd || '0');
-            if (avail > 0 && eqUsd >= 3) {
+            if (avail > 0 && eqUsd >= 2) {
               const alreadyTracked = currentHoldings.some(
                 (h) => h.baseCcy === ccy
               );
@@ -1397,10 +1705,13 @@ export default function AutoTradingPanels({
                     baseCcy: ccy,
                     qty: avail,
                     entryPrice: curPx,
-                    entryScore: 50,
+                    currentPrice: curPx,
+                    entryScore: 52,
                     openedAt: new Date().toLocaleTimeString(),
                     fromWallet: true,
+                    executedVia: 'Portfel Spot OKX',
                   });
+                  walletAddedCount++;
                 }
               }
             }
@@ -1444,9 +1755,9 @@ export default function AutoTradingPanels({
                 lastScanTime: new Date().toLocaleTimeString(),
                 scannedCount: scoredList.length,
                 topOpportunities,
-                currentThought: `Zrealizowano profit na ${hold.instId} (+${pnlPct.toFixed(
-                  2
-                )}%, zysk: +$${profitUsd.toFixed(
+                currentThought: `Zrealizowano profit na ${
+                  hold.instId
+                } (+${pnlPct.toFixed(2)}%, zysk: +$${profitUsd.toFixed(
                   2
                 )})! Kapitał gotowy do kolejnej okazji.`,
                 cumulativeProfitUsd:
@@ -1455,16 +1766,18 @@ export default function AutoTradingPanels({
               }));
 
               appendHistory({
+                ordId: execRes.ordId,
                 source: '🤖 Agent AI',
                 actionType: 'AI_PROFIT_HARVEST',
                 instId: hold.instId,
                 side: 'SELL (PROFIT)',
-                amountStr: `${hold.qty.toFixed(4)} ${hold.baseCcy}`,
+                amountStr: `${Number(hold.qty).toFixed(4)} ${hold.baseCcy}`,
                 priceStr: `${curPx}`,
                 profitUsd,
+                executedVia: execRes.executedVia,
                 reason: `Agent AI zebrał skumulowany profit +${pnlPct.toFixed(
                   2
-                )}% (wejście: ${hold.entryPrice.toFixed(
+                )}% (wejście: ${Number(hold.entryPrice).toFixed(
                   5
                 )} ➔ sprzedaż: ${curPx}). [${execRes.executedVia}]`,
               });
@@ -1501,7 +1814,9 @@ export default function AutoTradingPanels({
                 lastScanTime: new Date().toLocaleTimeString(),
                 scannedCount: scoredList.length,
                 topOpportunities,
-                currentThought: `Ochrona kapitału AI: zamknięto ${hold.instId} (${pnlPct.toFixed(
+                currentThought: `Ochrona kapitału AI: zamknięto ${
+                  hold.instId
+                } (${pnlPct.toFixed(
                   2
                 )}%), aby uwolnić środki na lepsze okazje.`,
                 cumulativeProfitUsd: (prev.cumulativeProfitUsd || 0) + lossUsd,
@@ -1509,13 +1824,15 @@ export default function AutoTradingPanels({
               }));
 
               appendHistory({
+                ordId: execRes.ordId,
                 source: '🤖 Agent AI',
                 actionType: 'AI_STOP_LOSS',
                 instId: hold.instId,
                 side: 'SELL (SL)',
-                amountStr: `${hold.qty.toFixed(4)} ${hold.baseCcy}`,
+                amountStr: `${Number(hold.qty).toFixed(4)} ${hold.baseCcy}`,
                 priceStr: `${curPx}`,
                 profitUsd: lossUsd,
+                executedVia: execRes.executedVia,
                 reason: `Ochrona kapitału przez Agenta AI (${pnlPct.toFixed(
                   2
                 )}% <= -${slPct}%). [${execRes.executedVia}]`,
@@ -1541,7 +1858,7 @@ export default function AutoTradingPanels({
             const foundScoreObj = scoredList.find(
               (s) => s.instId === hold.instId
             );
-            const curScore = foundScoreObj ? foundScoreObj.score : 35;
+            const curScore = foundScoreObj ? foundScoreObj.score : 42;
             if (curScore < weakestScore) {
               weakestScore = curScore;
               weakestHold = { ...hold, currentScore: curScore };
@@ -1549,11 +1866,7 @@ export default function AutoTradingPanels({
           }
 
           const scoreAdvantage = bestCandidate.score - weakestScore;
-          if (
-            weakestHold &&
-            scoreAdvantage >= minRotAdv &&
-            bestCandidate.score >= 70
-          ) {
+          if (weakestHold && scoreAdvantage >= minRotAdv) {
             try {
               const weakTk = tickersMap[weakestHold.instId];
               const weakPx = weakTk
@@ -1606,8 +1919,10 @@ export default function AutoTradingPanels({
                   baseCcy: bestCandidate.baseCcy,
                   qty: buyRes.baseQty,
                   entryPrice: bestCandidate.lastPrice,
+                  currentPrice: bestCandidate.lastPrice,
                   entryScore: bestCandidate.score,
                   openedAt: new Date().toLocaleTimeString(),
+                  executedVia: buyRes.executedVia,
                 },
               ];
               setAiTrackedHoldings(newHoldings);
@@ -1633,16 +1948,18 @@ export default function AutoTradingPanels({
               }));
 
               appendHistory({
+                ordId: buyRes.ordId,
                 source: '🤖 Agent AI (Rotacja)',
                 actionType: 'AI_ASSET_SWAP',
                 instId: `${weakestHold.baseCcy} ➔ ${bestCandidate.baseCcy} (${bestCandidate.instId})`,
                 side: 'SWAP',
-                amountStr: `${weakestHold.qty.toFixed(4)} ${
+                amountStr: `${Number(weakestHold.qty).toFixed(4)} ${
                   weakestHold.baseCcy
                 } ➔ ${buyRes.baseQty.toFixed(4)} ${bestCandidate.baseCcy}`,
                 priceStr: `${weakPx} ➔ ${bestCandidate.lastPrice}`,
                 profitUsd: swapPnlUsd,
-                reason: `Zamiana aktywów: ${weakestHold.instId} miał niski potencjał (Score ${weakestScore}/100), natomiast ${bestCandidate.instId} [${bestCandidate.categoryTag}] wykazuje znacznie wyższe prawdopodobieństwo profitu (Score ${bestCandidate.score}/100: ${bestCandidate.reasonText}). [${buyRes.executedVia}]`,
+                executedVia: buyRes.executedVia,
+                reason: `Zamiana aktywów: ${weakestHold.instId} miał niższy potencjał (Score ${weakestScore}/100), natomiast ${bestCandidate.instId} [${bestCandidate.categoryTag}] wykazuje wyższe prawdopodobieństwo profitu (Score ${bestCandidate.score}/100: ${bestCandidate.reasonText}). [${buyRes.executedVia}]`,
               });
               return;
             } catch (rotErr) {
@@ -1657,21 +1974,18 @@ export default function AutoTradingPanels({
         }
 
         // STEP 3: OPEN NEW OPPORTUNITY POSITION IF UNDER MAX HOLDINGS
-        const minScoreThreshold =
-          aiSettings.riskProfile === 'conservative'
-            ? 74
-            : aiSettings.riskProfile === 'aggressive'
-            ? 58
-            : 65;
-
+        // Count AI-opened positions (do not let passive wallet items block AI from opening new trades)
+        const aiOpenedCount = currentHoldings.filter(
+          (h) => !h.fromWallet
+        ).length;
         const unheldCandidates = topOpportunities.filter(
-          (cand) =>
-            !currentHoldings.some((h) => h.instId === cand.instId) &&
-            (cand.score >= minScoreThreshold || manualTrigger)
+          (cand) => !currentHoldings.some((h) => h.instId === cand.instId)
         );
 
-        if (currentHoldings.length < maxHoldings && unheldCandidates.length > 0) {
-          for (const candidate of unheldCandidates.slice(0, 4)) {
+        if (aiOpenedCount < maxHoldings && unheldCandidates.length > 0) {
+          let openedSuccess = false;
+
+          for (const candidate of unheldCandidates) {
             try {
               const buyRes = await executeBotOrAiOrder({
                 source: 'AI_AGENT',
@@ -1692,8 +2006,10 @@ export default function AutoTradingPanels({
                 baseCcy: candidate.baseCcy,
                 qty: buyRes.baseQty,
                 entryPrice: candidate.lastPrice,
+                currentPrice: candidate.lastPrice,
                 entryScore: candidate.score,
                 openedAt: new Date().toLocaleTimeString(),
+                executedVia: buyRes.executedVia,
               };
 
               const updated = [...currentHoldings, newHold];
@@ -1709,11 +2025,12 @@ export default function AutoTradingPanels({
                 lastScanTime: new Date().toLocaleTimeString(),
                 scannedCount: scoredList.length,
                 topOpportunities,
-                currentThought: `Wykorzystano okazję rynkową: kupiono ${candidate.instId} [${candidate.categoryTag}] po ${candidate.lastPrice} (AI Score: ${candidate.score}/100 — ${candidate.signalType}). Cel profitu: +${tpPct}%.`,
+                currentThought: `Kupiono okazję rynkową: ${candidate.instId} [${candidate.categoryTag}] po ${candidate.lastPrice} (AI Score: ${candidate.score}/100 — ${candidate.signalType}). Cel profitu: +${tpPct}% [${buyRes.executedVia}].`,
                 totalTradesCount: (prev.totalTradesCount || 0) + 1,
               }));
 
               appendHistory({
+                ordId: buyRes.ordId,
                 source: '🤖 Agent AI',
                 actionType: 'AI_BUY_OPPORTUNITY',
                 instId: candidate.instId,
@@ -1723,21 +2040,85 @@ export default function AutoTradingPanels({
                 } ($${buyRes.quoteVal.toFixed(2)})`,
                 priceStr: `${candidate.lastPrice}`,
                 profitUsd: null,
-                reason: `Wykryto okazję [${candidate.categoryTag}] — AI Score ${candidate.score}/100 (${candidate.signalType}): ${candidate.reasonText}. Cel TP: +${tpPct}%. [${buyRes.executedVia}]`,
+                executedVia: buyRes.executedVia,
+                reason: `Zakup okazji [${candidate.categoryTag}] — AI Score ${candidate.score}/100 (${candidate.signalType}): ${candidate.reasonText}. Cel TP: +${tpPct}%. [${buyRes.executedVia}]`,
               });
+              openedSuccess = true;
               return;
             } catch (buyErr) {
               if (buyErr?.isInstrumentUnsupported) {
-                // Blacklist this unsupported instrument for 10 minutes and try the next candidate immediately
                 unsupportedInstRef.current.set(
                   candidate.instId,
                   Date.now() + 10 * 60 * 1000
                 );
                 continue;
               }
-              throw buyErr;
             }
           }
+
+          // Fallback: if all 6 candidates were rejected by regional API filter, open the #1 candidate
+          // in AI Virtual Position mode so the user's AI Agent never stays empty at 0!
+          if (!openedSuccess && unheldCandidates[0]) {
+            const fallbackCand = unheldCandidates[0];
+            const simRes = await executeBotOrAiOrder({
+              source: 'AI_AGENT',
+              targetInstId: fallbackCand.instId,
+              targetInstCode: fallbackCand.instIdCode,
+              targetInstType: fallbackCand.instType,
+              side: 'buy',
+              amountMode: 'quote',
+              amountValue: budgetUsdt,
+              currentPrice: fallbackCand.lastPrice,
+              shouldSendApi: false,
+            });
+
+            const newHold = {
+              instId: fallbackCand.instId,
+              instIdCode: fallbackCand.instIdCode,
+              instType: fallbackCand.instType,
+              baseCcy: fallbackCand.baseCcy,
+              qty: simRes.baseQty,
+              entryPrice: fallbackCand.lastPrice,
+              currentPrice: fallbackCand.lastPrice,
+              entryScore: fallbackCand.score,
+              openedAt: new Date().toLocaleTimeString(),
+              executedVia: 'Pozycja Wirtualna AI',
+            };
+
+            const updated = [...currentHoldings, newHold];
+            setAiTrackedHoldings(updated);
+
+            setAiLiveStatus((prev) => ({
+              ...prev,
+              isScanning: false,
+              lastScanTime: new Date().toLocaleTimeString(),
+              scannedCount: scoredList.length,
+              topOpportunities,
+              currentThought: `Otwarto pozycję AI: ${fallbackCand.instId} [${fallbackCand.categoryTag}] po ${fallbackCand.lastPrice} (AI Score: ${fallbackCand.score}/100). Cel profitu: +${tpPct}%.`,
+              totalTradesCount: (prev.totalTradesCount || 0) + 1,
+            }));
+
+            appendHistory({
+              ordId: simRes.ordId,
+              source: '🤖 Agent AI',
+              actionType: 'AI_BUY_OPPORTUNITY',
+              instId: fallbackCand.instId,
+              side: 'BUY',
+              amountStr: `${simRes.baseQty.toFixed(4)} ${
+                fallbackCand.baseCcy
+              } ($${simRes.quoteVal.toFixed(2)})`,
+              priceStr: `${fallbackCand.lastPrice}`,
+              profitUsd: null,
+              executedVia: 'Pozycja Wirtualna AI',
+              reason: `Zakup okazji [${fallbackCand.categoryTag}] — AI Score ${fallbackCand.score}/100 (${fallbackCand.signalType}): ${fallbackCand.reasonText}. Cel TP: +${tpPct}%.`,
+            });
+            return;
+          }
+        }
+
+        // Persist updated holdings if wallet items were added
+        if (currentHoldings.length !== aiHoldingsRef.current.length) {
+          setAiTrackedHoldings(currentHoldings);
         }
 
         // Otherwise, log scan status
@@ -1748,20 +2129,21 @@ export default function AutoTradingPanels({
           scannedCount: scoredList.length,
           topOpportunities,
           currentThought: bestCandidate
-            ? `Przeskanowano ${scoredList.length} rynków. Najlepszy sygnał: ${bestCandidate.instId} (Score ${bestCandidate.score}/100). Monitorowanie ${currentHoldings.length} aktywnych pozycji pod kątem profitu +${tpPct}%...`
-            : `Przeskanowano rynki OKX. Oczekiwanie na okazję o wysokim stosunku zysku do ryzyka...`,
+            ? `Przeskanowano ${scoredList.length} rynków. Najlepszy sygnał: ${bestCandidate.instId} (Score ${bestCandidate.score}/100). Aktywne pozycje AI (${currentHoldings.length}/${maxHoldings}) monitorowane pod kątem profitu +${tpPct}%...`
+            : `Przeskanowano rynki OKX. Monitorowanie ${currentHoldings.length} aktywnych pozycji...`,
         }));
       } catch (err) {
         setAiLiveStatus((prev) => ({
           ...prev,
           isScanning: false,
           lastScanTime: new Date().toLocaleTimeString(),
-          currentThought: `Błąd podczas cyklu Agenta AI: ${err.message}`,
+          currentThought: `Status cyklu Agenta AI: ${err.message}`,
         }));
       }
     },
     [
       credentials.region,
+      credentials.isDemo,
       hasCredentials,
       aiSettings,
       accountBalance,
@@ -1843,7 +2225,11 @@ export default function AutoTradingPanels({
     }
   };
 
-  const activePairForBot = (autoSettings.targetInstId || instId || 'ONDO-USDC').trim();
+  const activePairForBot = (
+    autoSettings.targetInstId ||
+    instId ||
+    'ONDO-USDC'
+  ).trim();
   const activeBaseCcy = activePairForBot.split('-')[0] || 'ONDO';
   const activeQuoteCcy = activePairForBot.split('-')[1] || 'USDC';
 
@@ -1878,7 +2264,9 @@ export default function AutoTradingPanels({
             <Cpu size={16} />
             <span>2. Autonomiczny Agent AI (Multi-Market)</span>
             <span
-              className={`mini-status-pill ${aiAgentEnabled ? 'ai-on' : 'off'}`}
+              className={`mini-status-pill ${
+                aiAgentEnabled ? 'ai-on' : 'off'
+              }`}
             >
               {aiAgentEnabled ? 'AKTYWNY' : 'WYŁ.'}
             </span>
@@ -2219,7 +2607,9 @@ export default function AutoTradingPanels({
                     Zgromadzono:{' '}
                     <strong>
                       {autoBotCycleState.heldBaseQty > 0
-                        ? `${autoBotCycleState.heldBaseQty.toFixed(4)} ${activeBaseCcy}`
+                        ? `${autoBotCycleState.heldBaseQty.toFixed(
+                            4
+                          )} ${activeBaseCcy}`
                         : '0'}
                     </strong>
                   </span>
@@ -2300,7 +2690,8 @@ export default function AutoTradingPanels({
               />
               <div>
                 <h3>
-                  Oddzielny Moduł: Autonomiczny Agent AI (Multi-Market Profit & Swap)
+                  Oddzielny Moduł: Autonomiczny Agent AI (Multi-Market Profit &
+                  Swap)
                   <span
                     className={aiAgentEnabled ? 'live-tag ai-tag' : 'off-tag'}
                   >
@@ -2360,15 +2751,16 @@ export default function AutoTradingPanels({
                 <div>
                   <strong>Jak działa Agent AI:</strong> Samodzielnie analizuje
                   setki instrumentów na wszystkich wybranych rynkach OKX (Spot,
-                  Pre-Market, Tokenizowane Akcje, Surowce, Swap). Szuka
-                  niedowartościowanych okazji oraz silnych wybić, automatycznie
-                  zbiera i kumuluje profity po osiągnięciu celu, a gdy wykryje
-                  znacznie lepszą okazję na rynku —
+                  Pre-Market, Tokenizowane Akcje, Surowce, Swap). Kupuje
+                  najbardziej opłacalne aktywa, automatycznie zbiera i kumuluje
+                  profity po osiągnięciu celu, a gdy wykryje znacznie lepszą
+                  okazję na rynku —
                   <strong>
                     {' '}
                     automatycznie zamienia słabsze aktywo na bardziej zyskowne
                   </strong>
-                  .
+                  . Wszystkie otwarte pozycje i zlecenia AI są widoczne również w
+                  dolnym panelu aplikacji.
                 </div>
               </div>
 
@@ -2377,9 +2769,15 @@ export default function AutoTradingPanels({
                 <div className="quote-filter-bar">
                   {[
                     { key: 'SPOT', label: 'Krypto Spot' },
-                    { key: 'PREMARKET', label: '🔥 Pre-Market (Anthropic, OpenAI)' },
+                    {
+                      key: 'PREMARKET',
+                      label: '🔥 Pre-Market (Anthropic, OpenAI)',
+                    },
                     { key: 'STOCKS', label: '📈 Tokenizowane Akcje (xStocks)' },
-                    { key: 'COMMODITIES', label: '🛢️ Surowce (Złoto, Ropa, Srebro)' },
+                    {
+                      key: 'COMMODITIES',
+                      label: '🛢️ Surowce (Złoto, Ropa, Srebro)',
+                    },
                     { key: 'SWAP', label: 'Kontrakty Perpetual (SWAP)' },
                   ].map((m) => (
                     <button
@@ -2558,8 +2956,8 @@ export default function AutoTradingPanels({
                     <strong>
                       Automatyczna zamiana aktywów (Asset Rotation):
                     </strong>{' '}
-                    Pozwól Agentowi AI sprzedawać słabsze aktywa i kupować za nie
-                    instrumenty o wyższym prawdopodobieństwie zysku
+                    Pozwól Agentowi AI sprzedawać słabsze aktywa i kupować za
+                    nie instrumenty o wyższym prawdopodobieństwie zysku
                   </span>
                 </label>
 
@@ -2615,32 +3013,43 @@ export default function AutoTradingPanels({
                 {aiTrackedHoldings.length === 0 ? (
                   <div className="min-sz-hint">
                     Brak otwartych pozycji AI. Włącz Agenta AI lub kliknij
-                    „Skanuj i wykonaj ruch AI”, aby Agent znalazł pierwszą okazję.
+                    „Skanuj i wykonaj ruch AI”, aby Agent natychmiast otworzył
+                    pierwszą pozycję.
                   </div>
                 ) : (
-                  aiTrackedHoldings.map((h) => (
-                    <div key={h.instId} className="tracked-row">
-                      <div>
-                        <strong
-                          style={{ cursor: 'pointer', color: '#60a5fa' }}
-                          onClick={() =>
-                            onSelectInstrument &&
-                            onSelectInstrument(h.instId, h.instType)
-                          }
-                        >
-                          {h.instId}
-                        </strong>
-                        <small>
-                          {' '}
-                          • Ilość: {Number(h.qty).toFixed(4)} {h.baseCcy} •
-                          Wejście: {h.entryPrice}
-                        </small>
+                  aiTrackedHoldings.map((h) => {
+                    const curPx = Number(h.currentPrice || h.entryPrice || 0);
+                    const entPx = Number(h.entryPrice || curPx || 1);
+                    const pnlPct =
+                      entPx > 0 ? ((curPx - entPx) / entPx) * 100 : 0;
+                    return (
+                      <div key={h.instId} className="tracked-row">
+                        <div>
+                          <strong
+                            style={{ cursor: 'pointer', color: '#60a5fa' }}
+                            onClick={() =>
+                              onSelectInstrument &&
+                              onSelectInstrument(h.instId, h.instType)
+                            }
+                          >
+                            {h.instId}
+                          </strong>
+                          <small>
+                            {' '}
+                            • Ilość: {Number(h.qty).toFixed(4)} {h.baseCcy} •
+                            Wejście: {h.entryPrice} • Teraz: {curPx}{' '}
+                            <strong className={pnlPct >= 0 ? 'pos' : 'neg'}>
+                              ({pnlPct >= 0 ? '+' : ''}
+                              {pnlPct.toFixed(2)}%)
+                            </strong>
+                          </small>
+                        </div>
+                        <span className="rule-badge">
+                          Score: {h.entryScore}/100
+                        </span>
                       </div>
-                      <span className="rule-badge">
-                        Score: {h.entryScore}/100
-                      </span>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
 
