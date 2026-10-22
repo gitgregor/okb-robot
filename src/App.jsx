@@ -197,9 +197,52 @@ export default function App() {
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [orderFeedback, setOrderFeedback] = useState(null);
 
-  // Separate Master States for Automated Rule Bot & Autonomous AI Agent
-  const [autoBotEnabled, setAutoBotEnabled] = useState(false);
-  const [aiAgentEnabled, setAiAgentEnabled] = useState(false);
+  // Separate Master States for Automated Rule Bot & Autonomous AI Agent (persisted & synced across devices)
+  const [autoBotEnabled, setAutoBotEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('okx_autobot_enabled_v2') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [aiAgentEnabled, setAiAgentEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('okx_ai_agent_enabled_v2') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [userToggleSignal, setUserToggleSignal] = useState(0);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('okx_autobot_enabled_v2', String(autoBotEnabled));
+    } catch {
+      // ignore
+    }
+  }, [autoBotEnabled]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('okx_ai_agent_enabled_v2', String(aiAgentEnabled));
+    } catch {
+      // ignore
+    }
+  }, [aiAgentEnabled]);
+
+  const handleUserToggleAutoBot = useCallback((nextVal) => {
+    setAutoBotEnabled((prev) =>
+      typeof nextVal === 'boolean' ? nextVal : !prev
+    );
+    setUserToggleSignal(Date.now());
+  }, []);
+
+  const handleUserToggleAiAgent = useCallback((nextVal) => {
+    setAiAgentEnabled((prev) =>
+      typeof nextVal === 'boolean' ? nextVal : !prev
+    );
+    setUserToggleSignal(Date.now());
+  }, []);
 
   const hasCredentials = Boolean(
     credentials.apiKey.trim() &&
@@ -893,7 +936,7 @@ export default function App() {
             className={`top-module-status-pill ${
               autoBotEnabled ? 'bot-on' : 'bot-off'
             }`}
-            onClick={() => setAutoBotEnabled((v) => !v)}
+            onClick={() => handleUserToggleAutoBot()}
             title="Kliknij aby włączyć/wyłączyć Automatyczny Handel (Reguły)"
           >
             <Bot size={14} />
@@ -906,7 +949,7 @@ export default function App() {
             className={`top-module-status-pill ${
               aiAgentEnabled ? 'ai-on' : 'bot-off'
             }`}
-            onClick={() => setAiAgentEnabled((v) => !v)}
+            onClick={() => handleUserToggleAiAgent()}
             title="Kliknij aby aktywować/deaktywować Autonomicznego Agenta AI"
           >
             <Cpu size={14} />
@@ -1824,8 +1867,11 @@ export default function App() {
         onRefreshPrivateData={loadPrivateData}
         autoBotEnabled={autoBotEnabled}
         setAutoBotEnabled={setAutoBotEnabled}
+        onUserToggleAutoBot={handleUserToggleAutoBot}
         aiAgentEnabled={aiAgentEnabled}
         setAiAgentEnabled={setAiAgentEnabled}
+        onUserToggleAiAgent={handleUserToggleAiAgent}
+        userToggleSignal={userToggleSignal}
       />
 
       {/* Bottom Panel: Positions, Open Orders & Order History */}

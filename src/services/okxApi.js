@@ -506,15 +506,35 @@ async function okxRequest({
   return json?.data || [];
 }
 
+// Cache of numeric instIdCode & metadata per instId (required by OKX V5 WebSocket trade operations)
+const instIdCodeCache = new Map();
+const instInfoCache = new Map();
+
+function cacheInstrumentsMetadata(list) {
+  if (!Array.isArray(list)) return;
+  for (const item of list) {
+    if (!item?.instId) continue;
+    instInfoCache.set(item.instId, item);
+    if (item.instIdCode !== undefined && item.instIdCode !== null && item.instIdCode !== '') {
+      const numCode = Number(item.instIdCode);
+      if (!Number.isNaN(numCode)) {
+        instIdCodeCache.set(item.instId, numCode);
+      }
+    }
+  }
+}
+
 /**
  * Fetch all available instruments for a given instType ('SPOT' | 'SWAP' | 'FUTURES' | 'MARGIN').
  */
 export async function fetchAllInstruments(instType = 'SPOT', region = 'global') {
-  return okxRequest({
+  const data = await okxRequest({
     method: 'GET',
     requestPath: `/api/v5/public/instruments?instType=${encodeURIComponent(instType)}`,
     regionOverride: region,
   });
+  cacheInstrumentsMetadata(data);
+  return data;
 }
 
 /**
@@ -623,17 +643,51 @@ export async function fetchOrderBook(instId, sz = 8, region = 'global') {
 }
 
 /**
- * Fetch single instrument metadata (minSz, lotSz, tickSz, ctVal, lever, etc.).
+ * Fetch single instrument metadata (minSz, lotSz, tickSz, ctVal, lever, instIdCode, etc.).
  */
 export async function fetchInstrumentInfo(instId, instType = 'SPOT', region = 'global') {
+  if (instInfoCache.has(instId)) {
+    return instInfoCache.get(instId);
+  }
+  const inferredType =
+    instType ||
+    (instId?.endsWith('-SWAP')
+      ? 'SWAP'
+      : instId?.split('-').length > 2
+      ? 'FUTURES'
+      : 'SPOT');
   const data = await okxRequest({
     method: 'GET',
     requestPath: `/api/v5/public/instruments?instType=${encodeURIComponent(
-      instType
+      inferredType
     )}&instId=${encodeURIComponent(instId)}`,
     regionOverride: region,
   });
+  cacheInstrumentsMetadata(data);
   return data[0] || null;
+}
+
+/**
+ * Resolve numeric instIdCode for an instId (required by OKX V5 WebSocket op: 'order' / 'cancel-order').
+ */
+export async function resolveInstIdCode(instId, instType = 'SPOT', region = 'global') {
+  if (!instId) return undefined;
+  if (instIdCodeCache.has(instId)) {
+    return instIdCodeCache.get(instId);
+  }
+  try {
+    const info = await fetchInstrumentInfo(instId, instType, region);
+    if (info?.instIdCode !== undefined && info?.instIdCode !== null && info?.instIdCode !== '') {
+      const numCode = Number(info.instIdCode);
+      if (!Number.isNaN(numCode)) {
+        instIdCodeCache.set(instId, numCode);
+        return numCode;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
 }
 
 /**
@@ -1135,6 +1189,7 @@ export async function placeOrder(
   credentials,
   {
     instId,
+    instIdCode,
     instType = 'SPOT',
     tdMode = 'cash',
     ccy,
@@ -1190,19 +1245,37 @@ export async function placeOrder(
     payload.attachAlgoOrds = [attachAlgo];
   }
 
-  if (shouldUsePrivateWsDirect(credentials)) {
+  const sendViaWs = async () => {
+    const code =
+      instIdCode !== undefined && instIdCode !== null && instIdCode !== ''
+        ? Number(instIdCode)
+        : await resolveInstIdCode(instId, instType, credentials?.region || 'global');
+    const wsPayload = { ...payload };
+    if (code !== undefined && !Number.isNaN(code)) {
+      wsPayload.instIdCode = code;
+    }
     const sess = await ensurePrivateWsSession(credentials);
-    return sendPrivateWsOp(sess, 'order', [payload]);
+    return sendPrivateWsOp(sess, 'order', [wsPayload]);
+  };
+
+  if (shouldUsePrivateWsDirect(credentials)) {
+    return sendViaWs();
   }
 
-  const data = await okxRequest({
-    method: 'POST',
-    requestPath: '/api/v5/trade/order',
-    body: payload,
-    credentials,
-  });
-
-  return data[0];
+  try {
+    const data = await okxRequest({
+      method: 'POST',
+      requestPath: '/api/v5/trade/order',
+      body: payload,
+      credentials,
+    });
+    return data[0];
+  } catch (err) {
+    if (!IS_DEV && !err.code) {
+      return sendViaWs();
+    }
+    throw err;
+  }
 }
 
 /**
@@ -1216,8 +1289,14 @@ export async function closePositionMarket(
     const sess = await ensurePrivateWsSession(credentials);
     const posNum = parseFloat(pos);
     const isLong = posSide === 'long' || (posSide === 'net' && posNum > 0);
+    const code = await resolveInstIdCode(
+      instId,
+      instId?.endsWith('-SWAP') ? 'SWAP' : 'FUTURES',
+      credentials?.region || 'global'
+    );
     const closePayload = {
       instId,
+      ...(code !== undefined && !Number.isNaN(code) ? { instIdCode: code } : {}),
       tdMode: mgnMode || 'cross',
       side: isLong ? 'sell' : 'buy',
       ordType: 'market',
@@ -1257,8 +1336,19 @@ export async function closePositionMarket(
  */
 export async function cancelOrder(credentials, { instId, ordId }) {
   if (shouldUsePrivateWsDirect(credentials)) {
+    const code = await resolveInstIdCode(
+      instId,
+      instId?.endsWith('-SWAP') ? 'SWAP' : 'SPOT',
+      credentials?.region || 'global'
+    );
     const sess = await ensurePrivateWsSession(credentials);
-    return sendPrivateWsOp(sess, 'cancel-order', [{ instId, ordId }]);
+    return sendPrivateWsOp(sess, 'cancel-order', [
+      {
+        instId,
+        ...(code !== undefined && !Number.isNaN(code) ? { instIdCode: code } : {}),
+        ordId,
+      },
+    ]);
   }
 
   const data = await okxRequest({

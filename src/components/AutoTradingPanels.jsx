@@ -18,6 +18,7 @@ import {
   Sliders,
   Coins,
   Zap,
+  Smartphone,
 } from 'lucide-react';
 import {
   fetchAllInstruments,
@@ -25,6 +26,7 @@ import {
   fetchTicker,
   fetchOrderBook,
   fetchInstrumentInfo,
+  resolveInstIdCode,
   placeOrder,
   isPreMarketInstrument,
   isStockInstrument,
@@ -36,6 +38,29 @@ const AUTO_SETTINGS_KEY = 'okx_autobot_settings_v1';
 const AI_SETTINGS_KEY = 'okx_ai_agent_settings_v1';
 const ACTION_HISTORY_KEY = 'okx_auto_ai_history_v1';
 const AI_POSITIONS_KEY = 'okx_ai_tracked_positions_v1';
+const AUTO_CYCLE_STATE_KEY = 'okx_autobot_cycle_state_v1';
+const SYNC_META_KEY = 'okx_automation_sync_meta_v2';
+const DEVICE_ID_KEY = 'okx_automation_device_id_v2';
+
+// Shared cross-device sync channel for Desktop <-> Mobile state synchronization
+const CROSS_DEVICE_SYNC_TOPIC = 'okb_robot_gitgregor_live_sync_v2';
+const NTFY_BASE_URL = 'https://ntfy.sh';
+const NTFY_WS_URL = 'wss://ntfy.sh';
+
+function getOrCreateDeviceId() {
+  try {
+    const existing = localStorage.getItem(DEVICE_ID_KEY);
+    if (existing) return existing;
+    const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || '');
+    const id = `${isMobile ? 'mob' : 'dsk'}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    localStorage.setItem(DEVICE_ID_KEY, id);
+    return id;
+  } catch {
+    return `dev-${Math.random().toString(36).slice(2, 8)}`;
+  }
+}
 
 /**
  * Detailed descriptions of each automated trading method ("co robi i jak działa").
@@ -91,11 +116,31 @@ export default function AutoTradingPanels({
   onRefreshPrivateData,
   autoBotEnabled,
   setAutoBotEnabled,
+  onUserToggleAutoBot,
   aiAgentEnabled,
   setAiAgentEnabled,
+  onUserToggleAiAgent,
+  userToggleSignal,
 }) {
+  const deviceIdRef = useRef(getOrCreateDeviceId());
+  const localUpdatedAtRef = useRef((() => {
+    try {
+      const meta = JSON.parse(localStorage.getItem(SYNC_META_KEY) || '{}');
+      return Number(meta.updatedAt || 0);
+    } catch {
+      return 0;
+    }
+  })());
+  const isApplyingRemoteRef = useRef(false);
+  const unsupportedInstRef = useRef(new Map());
+
   // Sub-tab inside the Automation Center ('autobot' | 'ai_agent' | 'history')
   const [activeSubTab, setActiveSubTab] = useState('autobot');
+  const [syncStatus, setSyncStatus] = useState({
+    connected: false,
+    lastSyncTime: null,
+    remoteDevice: null,
+  });
 
   // ============================================================================
   // MODULE 1: RULE-BASED AUTO-TRADING BOT STATE
@@ -126,14 +171,22 @@ export default function AutoTradingPanels({
     };
   });
 
-  const [autoBotCycleState, setAutoBotCycleState] = useState({
-    referencePrice: null,
-    avgEntryPrice: null,
-    heldBaseQty: 0,
-    openCyclesCount: 0,
-    lastCheckTime: null,
-    lastStatusMsg: 'Oczekiwanie na uruchomienie...',
-    realizedProfitUsd: 0,
+  const [autoBotCycleState, setAutoBotCycleState] = useState(() => {
+    try {
+      const saved = localStorage.getItem(AUTO_CYCLE_STATE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore
+    }
+    return {
+      referencePrice: null,
+      avgEntryPrice: null,
+      heldBaseQty: 0,
+      openCyclesCount: 0,
+      lastCheckTime: null,
+      lastStatusMsg: 'Oczekiwanie na uruchomienie...',
+      realizedProfitUsd: 0,
+    };
   });
 
   // ============================================================================
@@ -201,7 +254,29 @@ export default function AutoTradingPanels({
     return [];
   });
 
-  // Persist settings, holdings, and history
+  // Keep refs of latest state for cross-device sync & intervals
+  const latestStateRef = useRef({
+    autoBotEnabled,
+    aiAgentEnabled,
+    autoSettings,
+    aiSettings,
+    autoBotCycleState,
+    aiTrackedHoldings,
+    aiLiveStatus,
+    actionHistory,
+  });
+  latestStateRef.current = {
+    autoBotEnabled,
+    aiAgentEnabled,
+    autoSettings,
+    aiSettings,
+    autoBotCycleState,
+    aiTrackedHoldings,
+    aiLiveStatus,
+    actionHistory,
+  };
+
+  // Persist settings, holdings, cycle state, and history locally
   useEffect(() => {
     try {
       localStorage.setItem(AUTO_SETTINGS_KEY, JSON.stringify(autoSettings));
@@ -209,6 +284,17 @@ export default function AutoTradingPanels({
       // ignore
     }
   }, [autoSettings]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        AUTO_CYCLE_STATE_KEY,
+        JSON.stringify(autoBotCycleState)
+      );
+    } catch {
+      // ignore
+    }
+  }, [autoBotCycleState]);
 
   useEffect(() => {
     try {
@@ -237,15 +323,298 @@ export default function AutoTradingPanels({
     }
   }, [actionHistory]);
 
-  const appendHistory = useCallback((entry) => {
-    const newItem = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      timestamp: new Date().toLocaleTimeString(),
-      dateStr: new Date().toLocaleDateString(),
-      ...entry,
+  // ============================================================================
+  // CROSS-DEVICE CLOUD SYNC ENGINE (DESKTOP <-> PHONE REAL-TIME STATE SYNC)
+  // ============================================================================
+  const publishCrossDeviceState = useCallback(
+    async (overrides = {}) => {
+      if (isApplyingRemoteRef.current) return;
+      const now = Date.now();
+      localUpdatedAtRef.current = now;
+      try {
+        localStorage.setItem(
+          SYNC_META_KEY,
+          JSON.stringify({ updatedAt: now, deviceId: deviceIdRef.current })
+        );
+      } catch {
+        // ignore
+      }
+
+      const cur = { ...latestStateRef.current, ...overrides };
+      // Keep payload compact (< 3KB) so ntfy.sh delivers it inline via JSON & WebSocket
+      const compactPayload = {
+        v: 2,
+        updatedAt: now,
+        deviceId: deviceIdRef.current,
+        autoBotEnabled: Boolean(cur.autoBotEnabled),
+        aiAgentEnabled: Boolean(cur.aiAgentEnabled),
+        autoSettings: cur.autoSettings,
+        aiSettings: cur.aiSettings,
+        autoBotCycleState: {
+          referencePrice: cur.autoBotCycleState?.referencePrice || null,
+          avgEntryPrice: cur.autoBotCycleState?.avgEntryPrice || null,
+          heldBaseQty: cur.autoBotCycleState?.heldBaseQty || 0,
+          openCyclesCount: cur.autoBotCycleState?.openCyclesCount || 0,
+          lastCheckTime: cur.autoBotCycleState?.lastCheckTime || null,
+          lastStatusMsg: (cur.autoBotCycleState?.lastStatusMsg || '').slice(
+            0,
+            140
+          ),
+          realizedProfitUsd: cur.autoBotCycleState?.realizedProfitUsd || 0,
+        },
+        aiTrackedHoldings: (cur.aiTrackedHoldings || []).slice(0, 6),
+        aiLiveStatus: {
+          lastScanTime: cur.aiLiveStatus?.lastScanTime || null,
+          scannedCount: cur.aiLiveStatus?.scannedCount || 0,
+          currentThought: (cur.aiLiveStatus?.currentThought || '').slice(
+            0,
+            160
+          ),
+          cumulativeProfitUsd: cur.aiLiveStatus?.cumulativeProfitUsd || 0,
+          totalSwapsCount: cur.aiLiveStatus?.totalSwapsCount || 0,
+          totalTradesCount: cur.aiLiveStatus?.totalTradesCount || 0,
+        },
+        recentHistory: (cur.actionHistory || []).slice(0, 6).map((h) => ({
+          ...h,
+          reason: (h.reason || '').slice(0, 120),
+        })),
+      };
+
+      try {
+        await fetch(`${NTFY_BASE_URL}/${CROSS_DEVICE_SYNC_TOPIC}`, {
+          method: 'POST',
+          body: JSON.stringify(compactPayload),
+        });
+        setSyncStatus((prev) => ({
+          ...prev,
+          connected: true,
+          lastSyncTime: new Date().toLocaleTimeString(),
+        }));
+      } catch {
+        // ignore network hiccup
+      }
+    },
+    []
+  );
+
+  const applyIncomingRemoteState = useCallback(
+    (packet) => {
+      if (!packet || packet.v !== 2 || !packet.updatedAt) return;
+      if (packet.deviceId === deviceIdRef.current) return;
+      if (packet.updatedAt <= localUpdatedAtRef.current) return;
+
+      isApplyingRemoteRef.current = true;
+      localUpdatedAtRef.current = packet.updatedAt;
+      try {
+        localStorage.setItem(
+          SYNC_META_KEY,
+          JSON.stringify({
+            updatedAt: packet.updatedAt,
+            deviceId: packet.deviceId,
+          })
+        );
+      } catch {
+        // ignore
+      }
+
+      if (typeof packet.autoBotEnabled === 'boolean') {
+        setAutoBotEnabled(packet.autoBotEnabled);
+      }
+      if (typeof packet.aiAgentEnabled === 'boolean') {
+        setAiAgentEnabled(packet.aiAgentEnabled);
+      }
+      if (packet.autoSettings) {
+        setAutoSettings((prev) => ({ ...prev, ...packet.autoSettings }));
+      }
+      if (packet.aiSettings) {
+        setAiSettings((prev) => ({ ...prev, ...packet.aiSettings }));
+      }
+      if (packet.autoBotCycleState) {
+        setAutoBotCycleState((prev) => ({
+          ...prev,
+          ...packet.autoBotCycleState,
+        }));
+      }
+      if (Array.isArray(packet.aiTrackedHoldings)) {
+        setAiTrackedHoldings(packet.aiTrackedHoldings);
+      }
+      if (packet.aiLiveStatus) {
+        setAiLiveStatus((prev) => ({
+          ...prev,
+          ...packet.aiLiveStatus,
+        }));
+      }
+      if (Array.isArray(packet.recentHistory) && packet.recentHistory.length > 0) {
+        setActionHistory((prev) => {
+          const existingIds = new Set(prev.map((item) => item.id));
+          const merged = [...prev];
+          for (const remItem of packet.recentHistory) {
+            if (remItem?.id && !existingIds.has(remItem.id)) {
+              merged.unshift(remItem);
+              existingIds.add(remItem.id);
+            }
+          }
+          return merged.slice(0, 150);
+        });
+      }
+
+      setSyncStatus({
+        connected: true,
+        lastSyncTime: new Date().toLocaleTimeString(),
+        remoteDevice: packet.deviceId,
+      });
+
+      setTimeout(() => {
+        isApplyingRemoteRef.current = false;
+      }, 80);
+    },
+    [setAutoBotEnabled, setAiAgentEnabled]
+  );
+
+  const pullLatestCrossDeviceState = useCallback(
+    async (isInitialMount = false) => {
+      try {
+        const res = await fetch(
+          `${NTFY_BASE_URL}/${CROSS_DEVICE_SYNC_TOPIC}/json?poll=1&since=48h`
+        );
+        if (!res.ok) return;
+        const text = await res.text();
+        const lines = text
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean);
+
+        let newestPacket = null;
+        for (const line of lines) {
+          try {
+            const env = JSON.parse(line);
+            if (env.event === 'message' && env.message) {
+              const parsed = JSON.parse(env.message);
+              if (
+                parsed &&
+                parsed.v === 2 &&
+                parsed.updatedAt &&
+                (!newestPacket || parsed.updatedAt > newestPacket.updatedAt)
+              ) {
+                newestPacket = parsed;
+              }
+            }
+          } catch {
+            // ignore non-JSON lines
+          }
+        }
+
+        setSyncStatus((prev) => ({
+          ...prev,
+          connected: true,
+          lastSyncTime: new Date().toLocaleTimeString(),
+        }));
+
+        if (newestPacket) {
+          if (newestPacket.updatedAt > localUpdatedAtRef.current) {
+            applyIncomingRemoteState(newestPacket);
+          } else if (
+            isInitialMount &&
+            localUpdatedAtRef.current > newestPacket.updatedAt
+          ) {
+            // Our local device has newer state than the cloud — push it so other devices get it
+            publishCrossDeviceState();
+          }
+        } else if (
+          isInitialMount &&
+          (latestStateRef.current.autoBotEnabled ||
+            latestStateRef.current.aiAgentEnabled ||
+            latestStateRef.current.actionHistory?.length > 0)
+        ) {
+          // Seed cloud channel if empty and this device already has active automation
+          publishCrossDeviceState();
+        }
+      } catch {
+        // ignore network error
+      }
+    },
+    [applyIncomingRemoteState, publishCrossDeviceState]
+  );
+
+  // Connect live WebSocket + periodic poll + focus/visibility sync for Desktop <-> Mobile
+  useEffect(() => {
+    pullLatestCrossDeviceState(true);
+
+    let ws = null;
+    try {
+      ws = new WebSocket(`${NTFY_WS_URL}/${CROSS_DEVICE_SYNC_TOPIC}/ws`);
+      ws.onopen = () => {
+        setSyncStatus((prev) => ({ ...prev, connected: true }));
+      };
+      ws.onmessage = (evt) => {
+        try {
+          const env = JSON.parse(evt.data);
+          if (env.event === 'message' && env.message) {
+            const parsed = JSON.parse(env.message);
+            applyIncomingRemoteState(parsed);
+          }
+        } catch {
+          // ignore
+        }
+      };
+    } catch {
+      // ignore ws error, polling handles fallback
+    }
+
+    const pollTimer = setInterval(() => {
+      pullLatestCrossDeviceState(false);
+    }, 5000);
+
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        pullLatestCrossDeviceState(false);
+      }
     };
-    setActionHistory((prev) => [newItem, ...prev].slice(0, 150));
-  }, []);
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    return () => {
+      clearInterval(pollTimer);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [pullLatestCrossDeviceState, applyIncomingRemoteState]);
+
+  // Whenever the user clicks a toggle button in App.jsx or inside AutoTradingPanels, broadcast immediately
+  useEffect(() => {
+    if (!userToggleSignal) return;
+    publishCrossDeviceState({
+      autoBotEnabled,
+      aiAgentEnabled,
+    });
+  }, [userToggleSignal, autoBotEnabled, aiAgentEnabled, publishCrossDeviceState]);
+
+  const appendHistory = useCallback(
+    (entry) => {
+      const newItem = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        timestamp: new Date().toLocaleTimeString(),
+        dateStr: new Date().toLocaleDateString(),
+        ...entry,
+      };
+      setActionHistory((prev) => {
+        const next = [newItem, ...prev].slice(0, 150);
+        setTimeout(() => {
+          publishCrossDeviceState({ actionHistory: next });
+        }, 50);
+        return next;
+      });
+    },
+    [publishCrossDeviceState]
+  );
 
   // Calculate total accumulated profits from history
   const totalRealizedProfit = actionHistory.reduce(
@@ -254,12 +623,13 @@ export default function AutoTradingPanels({
   );
 
   // ============================================================================
-  // HELPER: EXECUTE ORDER (REAL OKX API OR SIMULATION FALLBACK)
+  // HELPER: EXECUTE ORDER (REAL OKX API WITH instIdCode + SMART FALLBACK)
   // ============================================================================
   const executeBotOrAiOrder = useCallback(
     async ({
       source, // 'AUTOBOT' | 'AI_AGENT'
       targetInstId,
+      targetInstCode,
       targetInstType = 'SPOT',
       side, // 'buy' | 'sell'
       amountMode = 'quote', // 'base' | 'quote'
@@ -283,12 +653,35 @@ export default function AutoTradingPanels({
         amountMode === 'quote' ? rawAmt : rawAmt * px;
 
       if (shouldSendApi && hasCredentials) {
-        // Fetch instrument rules to respect lotSz and minSz
+        const region = credentials.region || 'global';
+
+        // Check available balance in wallet for SPOT buy orders so we adjust to available funds
+        if (targetInstType === 'SPOT' && side === 'buy' && accountBalance?.details) {
+          const quoteDetail = accountBalance.details.find(
+            (d) => d.ccy === quoteCcy
+          );
+          const availQuote = parseFloat(quoteDetail?.availBal || '0');
+          if (availQuote > 0 && availQuote < quoteVal && availQuote >= 1.5) {
+            quoteVal = Math.floor(availQuote * 98) / 100;
+            baseQty = (quoteVal / px) * 0.998;
+          }
+        }
+
+        // Fetch instrument metadata (lotSz, minSz, instIdCode)
         const info = await fetchInstrumentInfo(
           targetInstId,
           targetInstType,
-          credentials.region || 'global'
+          region
         ).catch(() => null);
+
+        const resolvedCode =
+          targetInstCode !== undefined &&
+          targetInstCode !== null &&
+          targetInstCode !== ''
+            ? Number(targetInstCode)
+            : info?.instIdCode !== undefined && info?.instIdCode !== ''
+            ? Number(info.instIdCode)
+            : await resolveInstIdCode(targetInstId, targetInstType, region);
 
         let szToSend;
         let tgtCcy;
@@ -318,34 +711,69 @@ export default function AutoTradingPanels({
           tgtCcy = targetInstType === 'SPOT' ? 'base_ccy' : undefined;
         }
 
-        const res = await placeOrder(credentials, {
-          instId: targetInstId,
-          instType: targetInstType,
-          tdMode: targetInstType === 'SPOT' ? 'cash' : 'cross',
-          side,
-          ordType: 'market',
-          sz: szToSend,
-          tgtCcy,
-        });
+        try {
+          const res = await placeOrder(credentials, {
+            instId: targetInstId,
+            instIdCode: resolvedCode,
+            instType: targetInstType,
+            tdMode: targetInstType === 'SPOT' ? 'cash' : 'cross',
+            side,
+            ordType: 'market',
+            sz: szToSend,
+            tgtCcy,
+          });
 
-        if (onRefreshPrivateData) {
-          onRefreshPrivateData();
+          if (onRefreshPrivateData) {
+            onRefreshPrivateData();
+          }
+
+          return {
+            executedVia: `API OKX (${credentials.isDemo ? 'Demo' : 'Live'})`,
+            ordId: res?.ordId || 'OK',
+            baseQty,
+            quoteVal,
+            baseCcy,
+            quoteCcy,
+            price: px,
+          };
+        } catch (apiErr) {
+          const errCode = String(apiErr?.code || '');
+          // If instrument is restricted in user's region (e.g. MiCA / EEA / delisted), flag it so AI skips to next candidate
+          if (
+            errCode === '50014' ||
+            errCode === '51001' ||
+            errCode === '51155' ||
+            errCode === '51004' ||
+            errCode === '51006'
+          ) {
+            apiErr.isInstrumentUnsupported = true;
+            throw apiErr;
+          }
+          // If Autonomous AI Agent has insufficient free cash balance on exchange (51008) or min size (51020),
+          // fall back gracefully to virtual paper execution instead of crashing the AI loop
+          if (
+            source === 'AI_AGENT' &&
+            (errCode === '51008' || errCode === '51020' || errCode === '51000')
+          ) {
+            return {
+              executedVia: `Tryb Wirtualny AI (brak wolnego salda ${quoteCcy} na giełdzie)`,
+              ordId: `AI-SIM-${Date.now().toString().slice(-5)}`,
+              baseQty,
+              quoteVal,
+              baseCcy,
+              quoteCcy,
+              price: px,
+            };
+          }
+          throw apiErr;
         }
-
-        return {
-          executedVia: `API OKX (${credentials.isDemo ? 'Demo' : 'Live'})`,
-          ordId: res?.ordId || 'OK',
-          baseQty,
-          quoteVal,
-          baseCcy,
-          quoteCcy,
-          price: px,
-        };
       }
 
       // Simulated execution when API is not connected or Dry-Run mode is chosen
       return {
-        executedVia: hasCredentials ? 'Tryb Symulacji' : 'Symulacja (Brak klucza API)',
+        executedVia: hasCredentials
+          ? 'Tryb Symulacji'
+          : 'Symulacja (Brak klucza API)',
         ordId: `SIM-${Date.now().toString().slice(-5)}`,
         baseQty,
         quoteVal,
@@ -354,7 +782,7 @@ export default function AutoTradingPanels({
         price: px,
       };
     },
-    [credentials, hasCredentials, onRefreshPrivateData]
+    [credentials, hasCredentials, accountBalance, onRefreshPrivateData]
   );
 
   // ============================================================================
@@ -577,7 +1005,7 @@ export default function AutoTradingPanels({
                     2
                   )}% poniżej średniej ceny wejścia.`;
           }
-          // Manual trigger test if user clicked "Wykonaj test reguły teraz"
+          // Manual trigger test if user clicked "Testuj cykl teraz"
           else if (manualTrigger && st.openCyclesCount === 0) {
             const activeNames = AUTO_TRADING_RULES_CATALOG.filter(
               (r) => rules[r.id]
@@ -707,111 +1135,121 @@ export default function AutoTradingPanels({
 
   /**
    * Computes an AI Opportunity Score (0 - 100) for any OKX instrument + live ticker.
-   * Evaluates oversold bounce potential, intraday volatility reward, spread tightness,
-   * and momentum across Spot, Pre-Market, Tokenized Stocks, Commodities, and Swaps.
    */
-  const scoreInstrumentOpportunity = useCallback(
-    (inst, tk) => {
-      if (!inst || !tk) return null;
-      const last = parseFloat(tk.last || '0');
-      const open = parseFloat(tk.open24h || '0');
-      const high = parseFloat(tk.high24h || '0');
-      const low = parseFloat(tk.low24h || '0');
-      const bid = parseFloat(tk.bidPx || last);
-      const ask = parseFloat(tk.askPx || last);
-      const volCcy = parseFloat(tk.volCcy24h || tk.vol24h || '0');
+  const scoreInstrumentOpportunity = useCallback((inst, tk) => {
+    if (!inst || !tk) return null;
+    if (inst.state && inst.state !== 'live') return null;
 
-      if (last <= 0 || open <= 0 || high <= low) return null;
+    // Require a valid numeric instIdCode so WebSocket orders never fail with 50014
+    const instIdCodeNum =
+      inst.instIdCode !== undefined &&
+      inst.instIdCode !== null &&
+      inst.instIdCode !== ''
+        ? Number(inst.instIdCode)
+        : undefined;
+    if (instIdCodeNum === undefined || Number.isNaN(instIdCodeNum)) {
+      return null;
+    }
 
-      // Spread % check — avoid illiquid wide spreads (> 0.65%)
-      const spreadPct = ask > 0 ? ((ask - bid) / last) * 100 : 0;
-      if (spreadPct > 0.75) return null;
+    const last = parseFloat(tk.last || '0');
+    const open = parseFloat(tk.open24h || '0');
+    const high = parseFloat(tk.high24h || '0');
+    const low = parseFloat(tk.low24h || '0');
+    const bid = parseFloat(tk.bidPx || last);
+    const ask = parseFloat(tk.askPx || last);
+    const volCcy = parseFloat(tk.volCcy24h || tk.vol24h || '0');
 
-      const change24hPct = ((last - open) / open) * 100;
-      const volatility24hPct = ((high - low) / low) * 100;
-      const posInRange = (last - low) / (high - low); // 0.0 = at 24h low, 1.0 = at 24h high
+    if (last <= 0 || open <= 0 || high <= low) return null;
 
-      // Require minimum intraday movement potential (> 0.8%)
-      if (volatility24hPct < 0.8) return null;
+    // Spread % check — avoid illiquid wide spreads (> 0.65%)
+    const spreadPct = ask > 0 ? ((ask - bid) / last) * 100 : 0;
+    if (spreadPct > 0.75) return null;
 
-      let score = 40;
-      let signalType = 'Akumulacja';
-      const reasons = [];
+    const change24hPct = ((last - open) / open) * 100;
+    const volatility24hPct = ((high - low) / low) * 100;
+    const posInRange = (last - low) / (high - low); // 0.0 = at 24h low, 1.0 = at 24h high
 
-      // Factor 1: Strong oversold bounce opportunity (near 24h low with solid volatility)
-      if (posInRange <= 0.25 && volatility24hPct >= 2.0) {
-        const bounceBonus = Math.round((0.28 - posInRange) * 95);
-        score += bounceBonus;
-        signalType = 'Odbicie z wyprzedania (Dip Buy)';
-        reasons.push(
-          `nisko w kanale 24h (${(posInRange * 100).toFixed(
-            0
-          )}% od dołka) przy zmienności ${volatility24hPct.toFixed(1)}%`
-        );
-      }
-      // Factor 2: Strong positive momentum breakout with room to 24h high
-      else if (change24hPct >= 1.2 && posInRange >= 0.45 && posInRange <= 0.88) {
-        const momBonus = Math.min(28, Math.round(change24hPct * 3.2));
-        score += momBonus;
-        signalType = 'Momentum & Trend Wzrostowy';
-        reasons.push(
-          `silny impet +${change24hPct.toFixed(
-            2
-          )}% z przestrzenią do szczytu 24h`
-        );
-      } else {
-        score += Math.round((0.5 - Math.abs(posInRange - 0.35)) * 20);
-      }
+    // Require minimum intraday movement potential (> 0.8%)
+    if (volatility24hPct < 0.8) return null;
 
-      // Factor 3: Tight spread & high liquidity bonus
-      if (spreadPct < 0.12) {
-        score += 12;
-        reasons.push(`bardzo wąski spread (${spreadPct.toFixed(3)}%)`);
-      } else if (spreadPct < 0.25) {
-        score += 6;
-      }
+    let score = 40;
+    let signalType = 'Akumulacja';
+    const reasons = [];
 
-      // Factor 4: Volatility-to-reward bonus
-      if (volatility24hPct >= 3.5 && volatility24hPct <= 18) {
-        score += 10;
-      }
+    // Factor 1: Strong oversold bounce opportunity (near 24h low with solid volatility)
+    if (posInRange <= 0.25 && volatility24hPct >= 2.0) {
+      const bounceBonus = Math.round((0.28 - posInRange) * 95);
+      score += bounceBonus;
+      signalType = 'Odbicie z wyprzedania (Dip Buy)';
+      reasons.push(
+        `nisko w kanale 24h (${(posInRange * 100).toFixed(
+          0
+        )}% od dołka) przy zmienności ${volatility24hPct.toFixed(1)}%`
+      );
+    }
+    // Factor 2: Strong positive momentum breakout with room to 24h high
+    else if (change24hPct >= 1.2 && posInRange >= 0.45 && posInRange <= 0.88) {
+      const momBonus = Math.min(28, Math.round(change24hPct * 3.2));
+      score += momBonus;
+      signalType = 'Momentum & Trend Wzrostowy';
+      reasons.push(
+        `silny impet +${change24hPct.toFixed(
+          2
+        )}% z przestrzenią do szczytu 24h`
+      );
+    } else {
+      score += Math.round((0.5 - Math.abs(posInRange - 0.35)) * 20);
+    }
 
-      // Factor 5: Category tagging
-      let categoryTag = inst.instType;
-      if (isPreMarketInstrument(inst)) {
-        categoryTag = 'PRE-MARKET';
-        score += 4;
-      } else if (isCommodityInstrument(inst)) {
-        categoryTag = `SUROWIEC (${getCommodityDescription(inst) || inst.baseCcy})`;
-        score += 3;
-      } else if (isStockInstrument(inst)) {
-        categoryTag = 'AKCJA / RWA';
-        score += 3;
-      }
+    // Factor 3: Tight spread & high liquidity bonus
+    if (spreadPct < 0.12) {
+      score += 12;
+      reasons.push(`bardzo wąski spread (${spreadPct.toFixed(3)}%)`);
+    } else if (spreadPct < 0.25) {
+      score += 6;
+    }
 
-      score = Math.max(5, Math.min(99, score));
+    // Factor 4: Volatility-to-reward bonus
+    if (volatility24hPct >= 3.5 && volatility24hPct <= 18) {
+      score += 10;
+    }
 
-      return {
-        instId: inst.instId,
-        instType: inst.instType,
-        baseCcy: inst.baseCcy || inst.instId.split('-')[0],
-        quoteCcy: inst.quoteCcy || inst.instId.split('-')[1] || 'USDT',
-        categoryTag,
-        lastPrice: last,
-        change24hPct,
-        volatility24hPct,
-        posInRange,
-        spreadPct,
-        volCcy,
-        score,
-        signalType,
-        reasonText:
-          reasons.join(', ') ||
-          `zmiana 24h: ${change24hPct.toFixed(2)}%, zmienność: ${volatility24hPct.toFixed(1)}%`,
-      };
-    },
-    []
-  );
+    // Factor 5: Category tagging
+    let categoryTag = inst.instType;
+    if (isPreMarketInstrument(inst)) {
+      categoryTag = 'PRE-MARKET';
+      score += 4;
+    } else if (isCommodityInstrument(inst)) {
+      categoryTag = `SUROWIEC (${getCommodityDescription(inst) || inst.baseCcy})`;
+      score += 3;
+    } else if (isStockInstrument(inst)) {
+      categoryTag = 'AKCJA / RWA';
+      score += 3;
+    }
+
+    score = Math.max(5, Math.min(99, score));
+
+    return {
+      instId: inst.instId,
+      instIdCode: instIdCodeNum,
+      instType: inst.instType,
+      baseCcy: inst.baseCcy || inst.instId.split('-')[0],
+      quoteCcy: inst.quoteCcy || inst.instId.split('-')[1] || 'USDC',
+      minSz: parseFloat(inst.minSz || '0'),
+      categoryTag,
+      lastPrice: last,
+      change24hPct,
+      volatility24hPct,
+      posInRange,
+      spreadPct,
+      volCcy,
+      score,
+      signalType,
+      reasonText:
+        reasons.join(', ') ||
+        `zmiana 24h: ${change24hPct.toFixed(2)}%, zmienność: ${volatility24hPct.toFixed(1)}%`,
+    };
+  }, []);
 
   const runAiAgentCycle = useCallback(
     async (manualTrigger = false) => {
@@ -820,6 +1258,16 @@ export default function AutoTradingPanels({
       try {
         const region = credentials.region || 'global';
         const allowed = aiSettings.allowedMarkets || {};
+
+        // Determine which quote currencies are supported in user's region / wallet
+        const availUsdc = parseFloat(
+          accountBalance?.details?.find((d) => d.ccy === 'USDC')?.availBal || '0'
+        );
+        const availUsdt = parseFloat(
+          accountBalance?.details?.find((d) => d.ccy === 'USDT')?.availBal || '0'
+        );
+        const preferUsdcOnly =
+          region === 'eea' || (availUsdc >= 1 && availUsdt < 1);
 
         // Fetch live catalogs for Spot and Swap
         const needSpot =
@@ -834,15 +1282,37 @@ export default function AutoTradingPanels({
           needSwap ? fetchAllTickers('SWAP', region).catch(() => []) : [],
         ]);
 
+        const instByIdMap = {};
+        for (const inst of [...spotInst, ...swapInst]) {
+          if (inst?.instId) instByIdMap[inst.instId] = inst;
+        }
+
         const tickersMap = {};
         for (const t of [...spotTick, ...swapTick]) {
           tickersMap[t.instId] = t;
         }
 
-        // Filter instruments according to allowed market categories & quote currencies (USDC / USDT)
+        const nowMs = Date.now();
+        const budgetUsdt = parseFloat(aiSettings.tradeBudgetUsdt || '20');
+
+        // Filter instruments according to allowed market categories & regional quote currency rules
         const candidateInstruments = [...spotInst, ...swapInst].filter((inst) => {
-          const quote = inst.quoteCcy || inst.settleCcy || inst.instId.split('-')[1];
+          const skipUntil = unsupportedInstRef.current.get(inst.instId);
+          if (skipUntil && skipUntil > nowMs) return false;
+
+          const quote =
+            inst.quoteCcy || inst.settleCcy || inst.instId.split('-')[1];
           if (quote !== 'USDC' && quote !== 'USDT') return false;
+
+          // On EEA accounts (MiCA) or when user holds USDC only, prioritize USDC pairs for real API orders
+          if (
+            preferUsdcOnly &&
+            aiSettings.executeRealOrders &&
+            hasCredentials &&
+            quote !== 'USDC'
+          ) {
+            return false;
+          }
 
           const isPre = isPreMarketInstrument(inst);
           const isStk = isStockInstrument(inst);
@@ -862,9 +1332,15 @@ export default function AutoTradingPanels({
           const tk = tickersMap[inst.instId];
           if (!tk) continue;
           const scored = scoreInstrumentOpportunity(inst, tk);
-          if (scored) {
-            scoredList.push(scored);
+          if (!scored) continue;
+          // Ensure minimum order value is compatible with budget
+          if (
+            scored.minSz > 0 &&
+            scored.minSz * scored.lastPrice > Math.max(budgetUsdt * 1.5, 25)
+          ) {
+            continue;
           }
+          scoredList.push(scored);
         }
 
         scoredList.sort((a, b) => b.score - a.score);
@@ -873,23 +1349,31 @@ export default function AutoTradingPanels({
 
         const tpPct = parseFloat(aiSettings.targetProfitPct || '1.1');
         const slPct = parseFloat(aiSettings.stopLossPct || '1.8');
-        const minRotAdv = parseFloat(aiSettings.minRotationAdvantageScore || '22');
-        const maxHoldings = parseInt(aiSettings.maxConcurrentHoldings || '4', 10);
-        const budgetUsdt = parseFloat(aiSettings.tradeBudgetUsdt || '20');
+        const minRotAdv = parseFloat(
+          aiSettings.minRotationAdvantageScore || '22'
+        );
+        const maxHoldings = parseInt(
+          aiSettings.maxConcurrentHoldings || '4',
+          10
+        );
 
         let currentHoldings = [...aiHoldingsRef.current];
 
-        // Also include real Spot holdings from user's OKX accountBalance (non-stablecoins with value > $5)
-        // so the AI Agent can monitor & rotate existing portfolio assets if allowAssetRotation is enabled!
+        // Include real Spot holdings from user's OKX accountBalance (non-stablecoins with value > $3)
         if (accountBalance?.details?.length) {
           for (const balItem of accountBalance.details) {
             const ccy = balItem.ccy;
-            if (ccy === 'USDT' || ccy === 'USDC' || ccy === 'USD' || ccy === 'EUR') {
+            if (
+              ccy === 'USDT' ||
+              ccy === 'USDC' ||
+              ccy === 'USD' ||
+              ccy === 'EUR'
+            ) {
               continue;
             }
             const avail = parseFloat(balItem.availBal || '0');
             const eqUsd = parseFloat(balItem.eqUsd || '0');
-            if (avail > 0 && eqUsd >= 5) {
+            if (avail > 0 && eqUsd >= 3) {
               const alreadyTracked = currentHoldings.some(
                 (h) => h.baseCcy === ccy
               );
@@ -903,8 +1387,12 @@ export default function AutoTradingPanels({
                   : null;
                 if (matchedPair) {
                   const curPx = parseFloat(tickersMap[matchedPair].last);
+                  const instMeta = instByIdMap[matchedPair];
                   currentHoldings.push({
                     instId: matchedPair,
+                    instIdCode: instMeta?.instIdCode
+                      ? Number(instMeta.instIdCode)
+                      : undefined,
                     instType: 'SPOT',
                     baseCcy: ccy,
                     qty: avail,
@@ -930,99 +1418,112 @@ export default function AutoTradingPanels({
               : 0;
 
           if (pnlPct >= tpPct) {
-            const execRes = await executeBotOrAiOrder({
-              source: 'AI_AGENT',
-              targetInstId: hold.instId,
-              targetInstType: hold.instType || 'SPOT',
-              side: 'sell',
-              amountMode: 'base',
-              amountValue: hold.qty,
-              currentPrice: curPx,
-              shouldSendApi: aiSettings.executeRealOrders,
-            });
+            try {
+              const execRes = await executeBotOrAiOrder({
+                source: 'AI_AGENT',
+                targetInstId: hold.instId,
+                targetInstCode:
+                  hold.instIdCode || instByIdMap[hold.instId]?.instIdCode,
+                targetInstType: hold.instType || 'SPOT',
+                side: 'sell',
+                amountMode: 'base',
+                amountValue: hold.qty,
+                currentPrice: curPx,
+                shouldSendApi: aiSettings.executeRealOrders,
+              });
 
-            const profitUsd = (curPx - hold.entryPrice) * hold.qty;
-            const updatedHoldings = currentHoldings.filter(
-              (h) => h.instId !== hold.instId
-            );
-            setAiTrackedHoldings(updatedHoldings);
+              const profitUsd = (curPx - hold.entryPrice) * hold.qty;
+              const updatedHoldings = currentHoldings.filter(
+                (h) => h.instId !== hold.instId
+              );
+              setAiTrackedHoldings(updatedHoldings);
 
-            setAiLiveStatus((prev) => ({
-              ...prev,
-              isScanning: false,
-              lastScanTime: new Date().toLocaleTimeString(),
-              scannedCount: scoredList.length,
-              topOpportunities,
-              currentThought: `Zrealizowano profit na ${hold.instId} (+${pnlPct.toFixed(
-                2
-              )}%, zysk: +$${profitUsd.toFixed(
-                2
-              )})! Kapitał gotowy do kolejnej okazji.`,
-              cumulativeProfitUsd: (prev.cumulativeProfitUsd || 0) + profitUsd,
-              totalTradesCount: (prev.totalTradesCount || 0) + 1,
-            }));
+              setAiLiveStatus((prev) => ({
+                ...prev,
+                isScanning: false,
+                lastScanTime: new Date().toLocaleTimeString(),
+                scannedCount: scoredList.length,
+                topOpportunities,
+                currentThought: `Zrealizowano profit na ${hold.instId} (+${pnlPct.toFixed(
+                  2
+                )}%, zysk: +$${profitUsd.toFixed(
+                  2
+                )})! Kapitał gotowy do kolejnej okazji.`,
+                cumulativeProfitUsd:
+                  (prev.cumulativeProfitUsd || 0) + profitUsd,
+                totalTradesCount: (prev.totalTradesCount || 0) + 1,
+              }));
 
-            appendHistory({
-              source: '🤖 Agent AI',
-              actionType: 'AI_PROFIT_HARVEST',
-              instId: hold.instId,
-              side: 'SELL (PROFIT)',
-              amountStr: `${hold.qty.toFixed(4)} ${hold.baseCcy}`,
-              priceStr: `${curPx}`,
-              profitUsd,
-              reason: `Agent AI zebrał skumulowany profit +${pnlPct.toFixed(
-                2
-              )}% (wejście: ${hold.entryPrice.toFixed(
-                5
-              )} ➔ sprzedaż: ${curPx}). [${execRes.executedVia}]`,
-            });
-            return;
+              appendHistory({
+                source: '🤖 Agent AI',
+                actionType: 'AI_PROFIT_HARVEST',
+                instId: hold.instId,
+                side: 'SELL (PROFIT)',
+                amountStr: `${hold.qty.toFixed(4)} ${hold.baseCcy}`,
+                priceStr: `${curPx}`,
+                profitUsd,
+                reason: `Agent AI zebrał skumulowany profit +${pnlPct.toFixed(
+                  2
+                )}% (wejście: ${hold.entryPrice.toFixed(
+                  5
+                )} ➔ sprzedaż: ${curPx}). [${execRes.executedVia}]`,
+              });
+              return;
+            } catch {
+              // continue checking other holdings
+            }
           }
 
           if (pnlPct <= -slPct && !hold.fromWallet) {
-            const execRes = await executeBotOrAiOrder({
-              source: 'AI_AGENT',
-              targetInstId: hold.instId,
-              targetInstType: hold.instType || 'SPOT',
-              side: 'sell',
-              amountMode: 'base',
-              amountValue: hold.qty,
-              currentPrice: curPx,
-              shouldSendApi: aiSettings.executeRealOrders,
-            });
+            try {
+              const execRes = await executeBotOrAiOrder({
+                source: 'AI_AGENT',
+                targetInstId: hold.instId,
+                targetInstCode:
+                  hold.instIdCode || instByIdMap[hold.instId]?.instIdCode,
+                targetInstType: hold.instType || 'SPOT',
+                side: 'sell',
+                amountMode: 'base',
+                amountValue: hold.qty,
+                currentPrice: curPx,
+                shouldSendApi: aiSettings.executeRealOrders,
+              });
 
-            const lossUsd = (curPx - hold.entryPrice) * hold.qty;
-            const updatedHoldings = currentHoldings.filter(
-              (h) => h.instId !== hold.instId
-            );
-            setAiTrackedHoldings(updatedHoldings);
+              const lossUsd = (curPx - hold.entryPrice) * hold.qty;
+              const updatedHoldings = currentHoldings.filter(
+                (h) => h.instId !== hold.instId
+              );
+              setAiTrackedHoldings(updatedHoldings);
 
-            setAiLiveStatus((prev) => ({
-              ...prev,
-              isScanning: false,
-              lastScanTime: new Date().toLocaleTimeString(),
-              scannedCount: scoredList.length,
-              topOpportunities,
-              currentThought: `Ochrona kapitału AI: zamknięto ${hold.instId} (${pnlPct.toFixed(
-                2
-              )}%), aby uwolnić środki na lepsze okazje.`,
-              cumulativeProfitUsd: (prev.cumulativeProfitUsd || 0) + lossUsd,
-              totalTradesCount: (prev.totalTradesCount || 0) + 1,
-            }));
+              setAiLiveStatus((prev) => ({
+                ...prev,
+                isScanning: false,
+                lastScanTime: new Date().toLocaleTimeString(),
+                scannedCount: scoredList.length,
+                topOpportunities,
+                currentThought: `Ochrona kapitału AI: zamknięto ${hold.instId} (${pnlPct.toFixed(
+                  2
+                )}%), aby uwolnić środki na lepsze okazje.`,
+                cumulativeProfitUsd: (prev.cumulativeProfitUsd || 0) + lossUsd,
+                totalTradesCount: (prev.totalTradesCount || 0) + 1,
+              }));
 
-            appendHistory({
-              source: '🤖 Agent AI',
-              actionType: 'AI_STOP_LOSS',
-              instId: hold.instId,
-              side: 'SELL (SL)',
-              amountStr: `${hold.qty.toFixed(4)} ${hold.baseCcy}`,
-              priceStr: `${curPx}`,
-              profitUsd: lossUsd,
-              reason: `Ochrona kapitału przez Agenta AI (${pnlPct.toFixed(
-                2
-              )}% <= -${slPct}%). [${execRes.executedVia}]`,
-            });
-            return;
+              appendHistory({
+                source: '🤖 Agent AI',
+                actionType: 'AI_STOP_LOSS',
+                instId: hold.instId,
+                side: 'SELL (SL)',
+                amountStr: `${hold.qty.toFixed(4)} ${hold.baseCcy}`,
+                priceStr: `${curPx}`,
+                profitUsd: lossUsd,
+                reason: `Ochrona kapitału przez Agenta AI (${pnlPct.toFixed(
+                  2
+                )}% <= -${slPct}%). [${execRes.executedVia}]`,
+              });
+              return;
+            } catch {
+              // continue
+            }
           }
         }
 
@@ -1032,7 +1533,6 @@ export default function AutoTradingPanels({
           currentHoldings.length > 0 &&
           bestCandidate
         ) {
-          // Find weakest currently held asset
           let weakestHold = null;
           let weakestScore = 999;
 
@@ -1054,86 +1554,105 @@ export default function AutoTradingPanels({
             scoreAdvantage >= minRotAdv &&
             bestCandidate.score >= 70
           ) {
-            const weakTk = tickersMap[weakestHold.instId];
-            const weakPx = weakTk
-              ? parseFloat(weakTk.last)
-              : weakestHold.entryPrice;
+            try {
+              const weakTk = tickersMap[weakestHold.instId];
+              const weakPx = weakTk
+                ? parseFloat(weakTk.last)
+                : weakestHold.entryPrice;
 
-            // 1. Sell weaker asset
-            const sellRes = await executeBotOrAiOrder({
-              source: 'AI_AGENT',
-              targetInstId: weakestHold.instId,
-              targetInstType: weakestHold.instType || 'SPOT',
-              side: 'buy' === 'sell' ? 'buy' : 'sell',
-              amountMode: 'base',
-              amountValue: weakestHold.qty,
-              currentPrice: weakPx,
-              shouldSendApi: aiSettings.executeRealOrders,
-            });
+              // 1. Sell weaker asset
+              await executeBotOrAiOrder({
+                source: 'AI_AGENT',
+                targetInstId: weakestHold.instId,
+                targetInstCode:
+                  weakestHold.instIdCode ||
+                  instByIdMap[weakestHold.instId]?.instIdCode,
+                targetInstType: weakestHold.instType || 'SPOT',
+                side: 'sell',
+                amountMode: 'base',
+                amountValue: weakestHold.qty,
+                currentPrice: weakPx,
+                shouldSendApi: aiSettings.executeRealOrders,
+              });
 
-            const swapPnlUsd =
-              (weakPx - weakestHold.entryPrice) * weakestHold.qty;
-            const proceedsUsdt = Math.max(
-              budgetUsdt,
-              weakestHold.qty * weakPx * 0.995
-            );
+              const swapPnlUsd =
+                (weakPx - weakestHold.entryPrice) * weakestHold.qty;
+              const proceedsUsdt = Math.max(
+                budgetUsdt,
+                weakestHold.qty * weakPx * 0.995
+              );
 
-            // 2. Immediately buy the stronger opportunity asset
-            const buyRes = await executeBotOrAiOrder({
-              source: 'AI_AGENT',
-              targetInstId: bestCandidate.instId,
-              targetInstType: bestCandidate.instType,
-              side: 'buy',
-              amountMode: 'quote',
-              amountValue: proceedsUsdt,
-              currentPrice: bestCandidate.lastPrice,
-              shouldSendApi: aiSettings.executeRealOrders,
-            });
+              // 2. Immediately buy the stronger opportunity asset
+              const buyRes = await executeBotOrAiOrder({
+                source: 'AI_AGENT',
+                targetInstId: bestCandidate.instId,
+                targetInstCode: bestCandidate.instIdCode,
+                targetInstType: bestCandidate.instType,
+                side: 'buy',
+                amountMode: 'quote',
+                amountValue: proceedsUsdt,
+                currentPrice: bestCandidate.lastPrice,
+                shouldSendApi: aiSettings.executeRealOrders,
+              });
 
-            const newHoldings = [
-              ...currentHoldings.filter((h) => h.instId !== weakestHold.instId),
-              {
-                instId: bestCandidate.instId,
-                instType: bestCandidate.instType,
-                baseCcy: bestCandidate.baseCcy,
-                qty: buyRes.baseQty,
-                entryPrice: bestCandidate.lastPrice,
-                entryScore: bestCandidate.score,
-                openedAt: new Date().toLocaleTimeString(),
-              },
-            ];
-            setAiTrackedHoldings(newHoldings);
+              const newHoldings = [
+                ...currentHoldings.filter(
+                  (h) => h.instId !== weakestHold.instId
+                ),
+                {
+                  instId: bestCandidate.instId,
+                  instIdCode: bestCandidate.instIdCode,
+                  instType: bestCandidate.instType,
+                  baseCcy: bestCandidate.baseCcy,
+                  qty: buyRes.baseQty,
+                  entryPrice: bestCandidate.lastPrice,
+                  entryScore: bestCandidate.score,
+                  openedAt: new Date().toLocaleTimeString(),
+                },
+              ];
+              setAiTrackedHoldings(newHoldings);
 
-            if (onSelectInstrument) {
-              onSelectInstrument(bestCandidate.instId, bestCandidate.instType);
+              if (onSelectInstrument) {
+                onSelectInstrument(
+                  bestCandidate.instId,
+                  bestCandidate.instType
+                );
+              }
+
+              setAiLiveStatus((prev) => ({
+                ...prev,
+                isScanning: false,
+                lastScanTime: new Date().toLocaleTimeString(),
+                scannedCount: scoredList.length,
+                topOpportunities,
+                currentThought: `🔄 Zamiana aktywów: sprzedano słabsze ${weakestHold.instId} (AI Score: ${weakestScore}) i kupiono silniejsze ${bestCandidate.instId} (AI Score: ${bestCandidate.score}, przewaga +${scoreAdvantage} pkt)!`,
+                cumulativeProfitUsd:
+                  (prev.cumulativeProfitUsd || 0) + swapPnlUsd,
+                totalSwapsCount: (prev.totalSwapsCount || 0) + 1,
+                totalTradesCount: (prev.totalTradesCount || 0) + 2,
+              }));
+
+              appendHistory({
+                source: '🤖 Agent AI (Rotacja)',
+                actionType: 'AI_ASSET_SWAP',
+                instId: `${weakestHold.baseCcy} ➔ ${bestCandidate.baseCcy} (${bestCandidate.instId})`,
+                side: 'SWAP',
+                amountStr: `${weakestHold.qty.toFixed(4)} ${
+                  weakestHold.baseCcy
+                } ➔ ${buyRes.baseQty.toFixed(4)} ${bestCandidate.baseCcy}`,
+                priceStr: `${weakPx} ➔ ${bestCandidate.lastPrice}`,
+                profitUsd: swapPnlUsd,
+                reason: `Zamiana aktywów: ${weakestHold.instId} miał niski potencjał (Score ${weakestScore}/100), natomiast ${bestCandidate.instId} [${bestCandidate.categoryTag}] wykazuje znacznie wyższe prawdopodobieństwo profitu (Score ${bestCandidate.score}/100: ${bestCandidate.reasonText}). [${buyRes.executedVia}]`,
+              });
+              return;
+            } catch (rotErr) {
+              if (rotErr?.isInstrumentUnsupported && bestCandidate?.instId) {
+                unsupportedInstRef.current.set(
+                  bestCandidate.instId,
+                  Date.now() + 10 * 60 * 1000
+                );
+              }
             }
-
-            setAiLiveStatus((prev) => ({
-              ...prev,
-              isScanning: false,
-              lastScanTime: new Date().toLocaleTimeString(),
-              scannedCount: scoredList.length,
-              topOpportunities,
-              currentThought: `🔄 Zamiana aktywów: sprzedano słabsze ${weakestHold.instId} (AI Score: ${weakestScore}) i kupiono silniejsze ${bestCandidate.instId} (AI Score: ${bestCandidate.score}, przewaga +${scoreAdvantage} pkt)!`,
-              cumulativeProfitUsd:
-                (prev.cumulativeProfitUsd || 0) + swapPnlUsd,
-              totalSwapsCount: (prev.totalSwapsCount || 0) + 1,
-              totalTradesCount: (prev.totalTradesCount || 0) + 2,
-            }));
-
-            appendHistory({
-              source: '🤖 Agent AI (Rotacja)',
-              actionType: 'AI_ASSET_SWAP',
-              instId: `${weakestHold.baseCcy} ➔ ${bestCandidate.baseCcy} (${bestCandidate.instId})`,
-              side: 'SWAP',
-              amountStr: `${weakestHold.qty.toFixed(4)} ${
-                weakestHold.baseCcy
-              } ➔ ${buyRes.baseQty.toFixed(4)} ${bestCandidate.baseCcy}`,
-              priceStr: `${weakPx} ➔ ${bestCandidate.lastPrice}`,
-              profitUsd: swapPnlUsd,
-              reason: `Zamiana aktywów: ${weakestHold.instId} miał niski potencjał (Score ${weakestScore}/100), natomiast ${bestCandidate.instId} [${bestCandidate.categoryTag}] wykazuje znacznie wyższe prawdopodobieństwo profitu (Score ${bestCandidate.score}/100: ${bestCandidate.reasonText}). [${buyRes.executedVia}]`,
-            });
-            return;
           }
         }
 
@@ -1145,69 +1664,80 @@ export default function AutoTradingPanels({
             ? 58
             : 65;
 
-        const unheldCandidate = topOpportunities.find(
-          (cand) => !currentHoldings.some((h) => h.instId === cand.instId)
+        const unheldCandidates = topOpportunities.filter(
+          (cand) =>
+            !currentHoldings.some((h) => h.instId === cand.instId) &&
+            (cand.score >= minScoreThreshold || manualTrigger)
         );
 
-        if (
-          unheldCandidate &&
-          currentHoldings.length < maxHoldings &&
-          (unheldCandidate.score >= minScoreThreshold || manualTrigger)
-        ) {
-          const buyRes = await executeBotOrAiOrder({
-            source: 'AI_AGENT',
-            targetInstId: unheldCandidate.instId,
-            targetInstType: unheldCandidate.instType,
-            side: 'buy',
-            amountMode: 'quote',
-            amountValue: budgetUsdt,
-            currentPrice: unheldCandidate.lastPrice,
-            shouldSendApi: aiSettings.executeRealOrders,
-          });
+        if (currentHoldings.length < maxHoldings && unheldCandidates.length > 0) {
+          for (const candidate of unheldCandidates.slice(0, 4)) {
+            try {
+              const buyRes = await executeBotOrAiOrder({
+                source: 'AI_AGENT',
+                targetInstId: candidate.instId,
+                targetInstCode: candidate.instIdCode,
+                targetInstType: candidate.instType,
+                side: 'buy',
+                amountMode: 'quote',
+                amountValue: budgetUsdt,
+                currentPrice: candidate.lastPrice,
+                shouldSendApi: aiSettings.executeRealOrders,
+              });
 
-          const newHold = {
-            instId: unheldCandidate.instId,
-            instType: unheldCandidate.instType,
-            baseCcy: unheldCandidate.baseCcy,
-            qty: buyRes.baseQty,
-            entryPrice: unheldCandidate.lastPrice,
-            entryScore: unheldCandidate.score,
-            openedAt: new Date().toLocaleTimeString(),
-          };
+              const newHold = {
+                instId: candidate.instId,
+                instIdCode: candidate.instIdCode,
+                instType: candidate.instType,
+                baseCcy: candidate.baseCcy,
+                qty: buyRes.baseQty,
+                entryPrice: candidate.lastPrice,
+                entryScore: candidate.score,
+                openedAt: new Date().toLocaleTimeString(),
+              };
 
-          const updated = [...currentHoldings, newHold];
-          setAiTrackedHoldings(updated);
+              const updated = [...currentHoldings, newHold];
+              setAiTrackedHoldings(updated);
 
-          if (onSelectInstrument) {
-            onSelectInstrument(
-              unheldCandidate.instId,
-              unheldCandidate.instType
-            );
+              if (onSelectInstrument) {
+                onSelectInstrument(candidate.instId, candidate.instType);
+              }
+
+              setAiLiveStatus((prev) => ({
+                ...prev,
+                isScanning: false,
+                lastScanTime: new Date().toLocaleTimeString(),
+                scannedCount: scoredList.length,
+                topOpportunities,
+                currentThought: `Wykorzystano okazję rynkową: kupiono ${candidate.instId} [${candidate.categoryTag}] po ${candidate.lastPrice} (AI Score: ${candidate.score}/100 — ${candidate.signalType}). Cel profitu: +${tpPct}%.`,
+                totalTradesCount: (prev.totalTradesCount || 0) + 1,
+              }));
+
+              appendHistory({
+                source: '🤖 Agent AI',
+                actionType: 'AI_BUY_OPPORTUNITY',
+                instId: candidate.instId,
+                side: 'BUY',
+                amountStr: `${buyRes.baseQty.toFixed(4)} ${
+                  candidate.baseCcy
+                } ($${buyRes.quoteVal.toFixed(2)})`,
+                priceStr: `${candidate.lastPrice}`,
+                profitUsd: null,
+                reason: `Wykryto okazję [${candidate.categoryTag}] — AI Score ${candidate.score}/100 (${candidate.signalType}): ${candidate.reasonText}. Cel TP: +${tpPct}%. [${buyRes.executedVia}]`,
+              });
+              return;
+            } catch (buyErr) {
+              if (buyErr?.isInstrumentUnsupported) {
+                // Blacklist this unsupported instrument for 10 minutes and try the next candidate immediately
+                unsupportedInstRef.current.set(
+                  candidate.instId,
+                  Date.now() + 10 * 60 * 1000
+                );
+                continue;
+              }
+              throw buyErr;
+            }
           }
-
-          setAiLiveStatus((prev) => ({
-            ...prev,
-            isScanning: false,
-            lastScanTime: new Date().toLocaleTimeString(),
-            scannedCount: scoredList.length,
-            topOpportunities,
-            currentThought: `Wykorzystano okazję rynkową: kupiono ${unheldCandidate.instId} [${unheldCandidate.categoryTag}] po ${unheldCandidate.lastPrice} (AI Score: ${unheldCandidate.score}/100 — ${unheldCandidate.signalType}). Cel profitu: +${tpPct}%.`,
-            totalTradesCount: (prev.totalTradesCount || 0) + 1,
-          }));
-
-          appendHistory({
-            source: '🤖 Agent AI',
-            actionType: 'AI_BUY_OPPORTUNITY',
-            instId: unheldCandidate.instId,
-            side: 'BUY',
-            amountStr: `${buyRes.baseQty.toFixed(4)} ${
-              unheldCandidate.baseCcy
-            } ($${buyRes.quoteVal.toFixed(2)})`,
-            priceStr: `${unheldCandidate.lastPrice}`,
-            profitUsd: null,
-            reason: `Wykryto okazję [${unheldCandidate.categoryTag}] — AI Score ${unheldCandidate.score}/100 (${unheldCandidate.signalType}): ${unheldCandidate.reasonText}. Cel TP: +${tpPct}%. [${buyRes.executedVia}]`,
-          });
-          return;
         }
 
         // Otherwise, log scan status
@@ -1232,6 +1762,7 @@ export default function AutoTradingPanels({
     },
     [
       credentials.region,
+      hasCredentials,
       aiSettings,
       accountBalance,
       scoreInstrumentOpportunity,
@@ -1252,8 +1783,28 @@ export default function AutoTradingPanels({
     return () => clearInterval(timer);
   }, [aiAgentEnabled, aiSettings.scanIntervalSec, runAiAgentCycle]);
 
+  const updateAutoSettingsAndSync = (updater) => {
+    setAutoSettings((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      setTimeout(() => {
+        publishCrossDeviceState({ autoSettings: next });
+      }, 40);
+      return next;
+    });
+  };
+
+  const updateAiSettingsAndSync = (updater) => {
+    setAiSettings((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      setTimeout(() => {
+        publishCrossDeviceState({ aiSettings: next });
+      }, 40);
+      return next;
+    });
+  };
+
   const toggleRule = (ruleId) => {
-    setAutoSettings((prev) => ({
+    updateAutoSettingsAndSync((prev) => ({
       ...prev,
       activeRules: {
         ...prev.activeRules,
@@ -1263,13 +1814,33 @@ export default function AutoTradingPanels({
   };
 
   const toggleAiMarket = (catKey) => {
-    setAiSettings((prev) => ({
+    updateAiSettingsAndSync((prev) => ({
       ...prev,
       allowedMarkets: {
         ...prev.allowedMarkets,
         [catKey]: !prev.allowedMarkets?.[catKey],
       },
     }));
+  };
+
+  const handleToggleAutoBotClick = () => {
+    if (onUserToggleAutoBot) {
+      onUserToggleAutoBot();
+    } else {
+      const next = !autoBotEnabled;
+      setAutoBotEnabled(next);
+      publishCrossDeviceState({ autoBotEnabled: next });
+    }
+  };
+
+  const handleToggleAiAgentClick = () => {
+    if (onUserToggleAiAgent) {
+      onUserToggleAiAgent();
+    } else {
+      const next = !aiAgentEnabled;
+      setAiAgentEnabled(next);
+      publishCrossDeviceState({ aiAgentEnabled: next });
+    }
   };
 
   const activePairForBot = (autoSettings.targetInstId || instId || 'ONDO-USDC').trim();
@@ -1307,7 +1878,7 @@ export default function AutoTradingPanels({
             <Cpu size={16} />
             <span>2. Autonomiczny Agent AI (Multi-Market)</span>
             <span
-              className={`mini-status-pill ${aiAgentEnabled ? 'on-ai' : 'off'}`}
+              className={`mini-status-pill ${aiAgentEnabled ? 'ai-on' : 'off'}`}
             >
               {aiAgentEnabled ? 'AKTYWNY' : 'WYŁ.'}
             </span>
@@ -1325,12 +1896,30 @@ export default function AutoTradingPanels({
           </button>
         </div>
 
-        <div className="automation-profit-summary">
-          <span>Skumulowany Profit (Bot + AI):</span>
-          <strong className={totalRealizedProfit >= 0 ? 'pos' : 'neg'}>
-            {totalRealizedProfit >= 0 ? '+' : ''}$
-            {totalRealizedProfit.toFixed(2)} USD
-          </strong>
+        <div className="automation-summary-pills">
+          <button
+            type="button"
+            className="summary-pill sync-pill-btn"
+            onClick={() => pullLatestCrossDeviceState(false)}
+            title="Stan włączenia/wyłączenia oraz ustawienia są automatycznie synchronizowane między komputerem (Desktop) a telefonem (Mobile)."
+          >
+            <Smartphone size={14} />
+            <span>
+              Sync Desktop ⇄ Telefon:{' '}
+              <strong className={syncStatus.connected ? 'pos' : ''}>
+                {syncStatus.connected ? 'Połączono (Na żywo)' : 'Łączenie...'}
+              </strong>
+            </span>
+            <RefreshCw size={12} />
+          </button>
+
+          <div className="summary-pill">
+            <span>Skumulowany Profit (Bot + AI):</span>
+            <strong className={totalRealizedProfit >= 0 ? 'pos' : 'neg'}>
+              {totalRealizedProfit >= 0 ? '+' : ''}$
+              {totalRealizedProfit.toFixed(2)} USD
+            </strong>
+          </div>
         </div>
       </div>
 
@@ -1342,27 +1931,25 @@ export default function AutoTradingPanels({
           {/* Status & Master Switch Banner */}
           <div
             className={`module-status-banner ${
-              autoBotEnabled ? 'status-active-green' : 'status-inactive'
+              autoBotEnabled ? 'status-active' : 'status-inactive'
             }`}
           >
             <div className="status-banner-left">
               <div
-                className={`pulse-indicator ${autoBotEnabled ? 'active' : ''}`}
+                className={`pulse-indicator ${
+                  autoBotEnabled ? 'pulse-green' : 'pulse-gray'
+                }`}
               />
               <div>
-                <div className="status-title-row">
-                  <h3>Moduł Automatycznego Handlu Regułowego</h3>
-                  <span
-                    className={`status-badge-lg ${
-                      autoBotEnabled ? 'on' : 'off'
-                    }`}
-                  >
+                <h3>
+                  Moduł Automatycznego Handlu Regułowego
+                  <span className={autoBotEnabled ? 'live-tag' : 'off-tag'}>
                     {autoBotEnabled
                       ? '🟢 STATUS: WŁĄCZONY (PRACUJE)'
                       : '⚪ STATUS: WYŁĄCZONY'}
                   </span>
-                </div>
-                <p className="status-live-desc">
+                </h3>
+                <p>
                   {autoBotCycleState.lastStatusMsg}
                   {autoBotCycleState.lastCheckTime &&
                     ` (Ostatni odczyt: ${autoBotCycleState.lastCheckTime})`}
@@ -1373,7 +1960,7 @@ export default function AutoTradingPanels({
             <div className="status-banner-actions">
               <button
                 type="button"
-                className="secondary-action-btn"
+                className="secondary-sm-btn"
                 onClick={() => runAutoBotStep(true)}
                 title="Wymuś natychmiastowe sprawdzenie i wykonanie reguły"
               >
@@ -1383,9 +1970,9 @@ export default function AutoTradingPanels({
               <button
                 type="button"
                 className={`master-power-btn ${
-                  autoBotEnabled ? 'btn-stop' : 'btn-start'
+                  autoBotEnabled ? 'turn-off' : 'turn-on'
                 }`}
-                onClick={() => setAutoBotEnabled((v) => !v)}
+                onClick={handleToggleAutoBotClick}
               >
                 {autoBotEnabled ? (
                   <>
@@ -1404,26 +1991,29 @@ export default function AutoTradingPanels({
 
           <div className="auto-two-col">
             {/* Left Column: Trading Quantity & Parameters Settings */}
-            <div className="auto-settings-box">
-              <div className="box-subheader">
+            <div className="auto-config-box">
+              <div className="box-title">
                 <Sliders size={15} />
-                <h4>Ustawienia Handlu i Ilości Aktywa</h4>
+                <span>Ustawienia Handlu i Ilości Aktywa</span>
               </div>
 
               <div className="form-group">
-                <label>Instrument handlowy (puste = aktualnie wybrana para: {instId})</label>
-                <input
-                  type="text"
-                  placeholder={`Domyślnie: ${instId}`}
-                  value={autoSettings.targetInstId}
-                  onChange={(e) =>
-                    setAutoSettings((prev) => ({
-                      ...prev,
-                      targetInstId: e.target.value.toUpperCase(),
-                    }))
-                  }
-                  className="auto-input"
-                />
+                <label>
+                  Instrument handlowy (puste = aktualnie wybrana para: {instId})
+                </label>
+                <div className="input-with-unit">
+                  <input
+                    type="text"
+                    placeholder={`Domyślnie: ${instId}`}
+                    value={autoSettings.targetInstId}
+                    onChange={(e) =>
+                      updateAutoSettingsAndSync((prev) => ({
+                        ...prev,
+                        targetInstId: e.target.value.toUpperCase(),
+                      }))
+                    }
+                  />
+                </div>
               </div>
 
               <div className="form-group">
@@ -1435,7 +2025,7 @@ export default function AutoTradingPanels({
                       autoSettings.amountMode === 'quote' ? 'active' : ''
                     }
                     onClick={() =>
-                      setAutoSettings((prev) => ({
+                      updateAutoSettingsAndSync((prev) => ({
                         ...prev,
                         amountMode: 'quote',
                       }))
@@ -1449,7 +2039,7 @@ export default function AutoTradingPanels({
                       autoSettings.amountMode === 'base' ? 'active' : ''
                     }
                     onClick={() =>
-                      setAutoSettings((prev) => ({
+                      updateAutoSettingsAndSync((prev) => ({
                         ...prev,
                         amountMode: 'base',
                       }))
@@ -1474,7 +2064,7 @@ export default function AutoTradingPanels({
                       min="0.0001"
                       value={autoSettings.tradeAmount}
                       onChange={(e) =>
-                        setAutoSettings((prev) => ({
+                        updateAutoSettingsAndSync((prev) => ({
                           ...prev,
                           tradeAmount: e.target.value,
                         }))
@@ -1497,7 +2087,7 @@ export default function AutoTradingPanels({
                       min="0.1"
                       value={autoSettings.dipBuyPct}
                       onChange={(e) =>
-                        setAutoSettings((prev) => ({
+                        updateAutoSettingsAndSync((prev) => ({
                           ...prev,
                           dipBuyPct: e.target.value,
                         }))
@@ -1516,7 +2106,7 @@ export default function AutoTradingPanels({
                       min="0.1"
                       value={autoSettings.takeProfitPct}
                       onChange={(e) =>
-                        setAutoSettings((prev) => ({
+                        updateAutoSettingsAndSync((prev) => ({
                           ...prev,
                           takeProfitPct: e.target.value,
                         }))
@@ -1535,7 +2125,7 @@ export default function AutoTradingPanels({
                       min="0.2"
                       value={autoSettings.stopLossPct}
                       onChange={(e) =>
-                        setAutoSettings((prev) => ({
+                        updateAutoSettingsAndSync((prev) => ({
                           ...prev,
                           stopLossPct: e.target.value,
                         }))
@@ -1554,7 +2144,7 @@ export default function AutoTradingPanels({
                       min="5"
                       value={autoSettings.checkIntervalSec}
                       onChange={(e) =>
-                        setAutoSettings((prev) => ({
+                        updateAutoSettingsAndSync((prev) => ({
                           ...prev,
                           checkIntervalSec: e.target.value,
                         }))
@@ -1574,7 +2164,7 @@ export default function AutoTradingPanels({
                       max="20"
                       value={autoSettings.maxOpenCycles}
                       onChange={(e) =>
-                        setAutoSettings((prev) => ({
+                        updateAutoSettingsAndSync((prev) => ({
                           ...prev,
                           maxOpenCycles: e.target.value,
                         }))
@@ -1590,56 +2180,60 @@ export default function AutoTradingPanels({
                   type="checkbox"
                   checked={autoSettings.executeRealOrders}
                   onChange={(e) =>
-                    setAutoSettings((prev) => ({
+                    updateAutoSettingsAndSync((prev) => ({
                       ...prev,
                       executeRealOrders: e.target.checked,
                     }))
                   }
                 />
                 <span>
-                  Wysyłaj rzeczywiste zlecenia do OKX API (gdy odznaczone: tryb symulacji)
+                  Wysyłaj rzeczywiste zlecenia do OKX API (gdy odznaczone: tryb
+                  symulacji)
                 </span>
               </label>
 
               {/* Current Cycle Live Summary */}
-              <div className="cycle-metrics-row">
-                <div>
-                  <span>Aktywna para:</span>
-                  <strong>{activePairForBot}</strong>
+              <div className="tracked-positions-mini">
+                <div className="tracked-header">
+                  <span>
+                    Aktywna para: <strong>{activePairForBot}</strong>
+                  </span>
+                  <span>
+                    Transze:{' '}
+                    <strong>
+                      {autoBotCycleState.openCyclesCount} /{' '}
+                      {autoSettings.maxOpenCycles}
+                    </strong>
+                  </span>
                 </div>
-                <div>
-                  <span>Otwarte transze:</span>
-                  <strong>
-                    {autoBotCycleState.openCyclesCount} /{' '}
-                    {autoSettings.maxOpenCycles}
-                  </strong>
-                </div>
-                <div>
-                  <span>Śr. cena zakupu:</span>
-                  <strong>
-                    {autoBotCycleState.avgEntryPrice
-                      ? autoBotCycleState.avgEntryPrice.toFixed(5)
-                      : '—'}
-                  </strong>
-                </div>
-                <div>
-                  <span>Zgromadzono:</span>
-                  <strong>
-                    {autoBotCycleState.heldBaseQty > 0
-                      ? `${autoBotCycleState.heldBaseQty.toFixed(4)} ${activeBaseCcy}`
-                      : '0'}
-                  </strong>
+                <div className="tracked-row">
+                  <span>
+                    Śr. wejście:{' '}
+                    <strong>
+                      {autoBotCycleState.avgEntryPrice
+                        ? autoBotCycleState.avgEntryPrice.toFixed(5)
+                        : '—'}
+                    </strong>
+                  </span>
+                  <span>
+                    Zgromadzono:{' '}
+                    <strong>
+                      {autoBotCycleState.heldBaseQty > 0
+                        ? `${autoBotCycleState.heldBaseQty.toFixed(4)} ${activeBaseCcy}`
+                        : '0'}
+                    </strong>
+                  </span>
                 </div>
               </div>
             </div>
 
             {/* Right Column: Rules Activation & Detailed Descriptions */}
             <div className="auto-rules-box">
-              <div className="box-subheader">
+              <div className="box-title">
                 <BookOpen size={15} />
-                <h4>
+                <span>
                   Aktywacja Reguł Handlu + Opis Metod (Co robią i jak działają)
-                </h4>
+                </span>
               </div>
 
               <div className="rules-catalog-list">
@@ -1650,7 +2244,9 @@ export default function AutoTradingPanels({
                   return (
                     <div
                       key={rule.id}
-                      className={`rule-card-item ${isRuleOn ? 'active' : ''}`}
+                      className={`rule-card-item ${
+                        isRuleOn ? 'rule-enabled' : ''
+                      }`}
                     >
                       <div className="rule-card-top">
                         <div className="rule-title-group">
@@ -1668,7 +2264,7 @@ export default function AutoTradingPanels({
                         </button>
                       </div>
 
-                      <div className="rule-explanation">
+                      <div className="rule-desc-block">
                         <p>
                           <strong>Co robi:</strong> {rule.whatItDoes}
                         </p>
@@ -1693,38 +2289,34 @@ export default function AutoTradingPanels({
           {/* Separate AI Agent Activation & Status Banner */}
           <div
             className={`module-status-banner ${
-              aiAgentEnabled ? 'status-active-ai' : 'status-inactive'
+              aiAgentEnabled ? 'status-ai-active' : 'status-inactive'
             }`}
           >
             <div className="status-banner-left">
               <div
-                className={`pulse-indicator ai ${
-                  aiAgentEnabled ? 'active' : ''
+                className={`pulse-indicator ${
+                  aiAgentEnabled ? 'pulse-purple' : 'pulse-gray'
                 }`}
               />
               <div>
-                <div className="status-title-row">
-                  <h3>
-                    Oddzielny Moduł: Autonomiczny Agent AI (Multi-Market Profit & Swap)
-                  </h3>
+                <h3>
+                  Oddzielny Moduł: Autonomiczny Agent AI (Multi-Market Profit & Swap)
                   <span
-                    className={`status-badge-lg ${
-                      aiAgentEnabled ? 'on-ai' : 'off'
-                    }`}
+                    className={aiAgentEnabled ? 'live-tag ai-tag' : 'off-tag'}
                   >
                     {aiAgentEnabled
                       ? '🤖 STATUS AGENTA AI: AKTYWNY (SKANUJE I HANDLUJE)'
                       : '⚪ STATUS AGENTA AI: DEZAKTYWOWANY'}
                   </span>
-                </div>
-                <p className="status-live-desc">{aiLiveStatus.currentThought}</p>
+                </h3>
+                <p>{aiLiveStatus.currentThought}</p>
               </div>
             </div>
 
             <div className="status-banner-actions">
               <button
                 type="button"
-                className="secondary-action-btn"
+                className="secondary-sm-btn"
                 onClick={() => runAiAgentCycle(true)}
                 disabled={aiLiveStatus.isScanning}
               >
@@ -1737,9 +2329,9 @@ export default function AutoTradingPanels({
               <button
                 type="button"
                 className={`master-power-btn ${
-                  aiAgentEnabled ? 'btn-stop' : 'btn-start-ai'
+                  aiAgentEnabled ? 'turn-off' : 'turn-on-ai'
                 }`}
-                onClick={() => setAiAgentEnabled((v) => !v)}
+                onClick={handleToggleAiAgentClick}
               >
                 {aiAgentEnabled ? (
                   <>
@@ -1758,24 +2350,31 @@ export default function AutoTradingPanels({
 
           <div className="auto-two-col">
             {/* Left Column: AI Agent Configuration & Market Scope */}
-            <div className="auto-settings-box">
-              <div className="box-subheader">
+            <div className="auto-config-box">
+              <div className="box-title">
                 <Cpu size={15} />
-                <h4>Konfiguracja Autonomicznego Agenta AI</h4>
+                <span>Konfiguracja Autonomicznego Agenta AI</span>
               </div>
 
-              <div className="ai-info-callout">
-                <strong>Jak działa Agent AI:</strong> Samodzielnie analizuje setki
-                instrumentów na wszystkich wybranych rynkach OKX (Spot, Pre-Market,
-                Tokenizowane Akcje, Surowce, Swap). Szuka niedowartościowanych
-                okazji oraz silnych wybić, automatycznie zbiera i kumuluje profity
-                po osiągnięciu celu, a gdy wykryje znacznie lepszą okazję na rynku —
-                <strong> automatycznie zamienia słabsze aktywo na bardziej zyskowne</strong>.
+              <div className="ai-agent-info-banner">
+                <div>
+                  <strong>Jak działa Agent AI:</strong> Samodzielnie analizuje
+                  setki instrumentów na wszystkich wybranych rynkach OKX (Spot,
+                  Pre-Market, Tokenizowane Akcje, Surowce, Swap). Szuka
+                  niedowartościowanych okazji oraz silnych wybić, automatycznie
+                  zbiera i kumuluje profity po osiągnięciu celu, a gdy wykryje
+                  znacznie lepszą okazję na rynku —
+                  <strong>
+                    {' '}
+                    automatycznie zamienia słabsze aktywo na bardziej zyskowne
+                  </strong>
+                  .
+                </div>
               </div>
 
               <div className="form-group">
                 <label>Rynki udostępnione dla Agenta AI (Multi-Market)</label>
-                <div className="ai-markets-pills">
+                <div className="quote-filter-bar">
                   {[
                     { key: 'SPOT', label: 'Krypto Spot' },
                     { key: 'PREMARKET', label: '🔥 Pre-Market (Anthropic, OpenAI)' },
@@ -1786,7 +2385,7 @@ export default function AutoTradingPanels({
                     <button
                       key={m.key}
                       type="button"
-                      className={`ai-market-pill ${
+                      className={`quote-pill ${
                         aiSettings.allowedMarkets?.[m.key] ? 'active' : ''
                       }`}
                       onClick={() => toggleAiMarket(m.key)}
@@ -1808,7 +2407,7 @@ export default function AutoTradingPanels({
                       min="2"
                       value={aiSettings.tradeBudgetUsdt}
                       onChange={(e) =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           tradeBudgetUsdt: e.target.value,
                         }))
@@ -1828,7 +2427,7 @@ export default function AutoTradingPanels({
                       max="15"
                       value={aiSettings.maxConcurrentHoldings}
                       onChange={(e) =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           maxConcurrentHoldings: e.target.value,
                         }))
@@ -1847,7 +2446,7 @@ export default function AutoTradingPanels({
                       min="0.2"
                       value={aiSettings.targetProfitPct}
                       onChange={(e) =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           targetProfitPct: e.target.value,
                         }))
@@ -1866,7 +2465,7 @@ export default function AutoTradingPanels({
                       min="0.3"
                       value={aiSettings.stopLossPct}
                       onChange={(e) =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           stopLossPct: e.target.value,
                         }))
@@ -1885,7 +2484,7 @@ export default function AutoTradingPanels({
                       min="8"
                       value={aiSettings.scanIntervalSec}
                       onChange={(e) =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           scanIntervalSec: e.target.value,
                         }))
@@ -1905,7 +2504,7 @@ export default function AutoTradingPanels({
                       max="60"
                       value={aiSettings.minRotationAdvantageScore}
                       onChange={(e) =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           minRotationAdvantageScore: e.target.value,
                         }))
@@ -1918,7 +2517,7 @@ export default function AutoTradingPanels({
 
               <div className="form-group">
                 <label>Profil decyzyjny Agenta AI</label>
-                <div className="unit-switch three-col">
+                <div className="pos-mode-pills">
                   {[
                     { id: 'conservative', label: 'Konserwatywny' },
                     { id: 'balanced', label: 'Zbalansowany Profit' },
@@ -1931,7 +2530,7 @@ export default function AutoTradingPanels({
                         aiSettings.riskProfile === p.id ? 'active' : ''
                       }
                       onClick={() =>
-                        setAiSettings((prev) => ({
+                        updateAiSettingsAndSync((prev) => ({
                           ...prev,
                           riskProfile: p.id,
                         }))
@@ -1949,14 +2548,16 @@ export default function AutoTradingPanels({
                     type="checkbox"
                     checked={aiSettings.allowAssetRotation}
                     onChange={(e) =>
-                      setAiSettings((prev) => ({
+                      updateAiSettingsAndSync((prev) => ({
                         ...prev,
                         allowAssetRotation: e.target.checked,
                       }))
                     }
                   />
                   <span>
-                    <strong>Automatyczna zamiana aktywów (Asset Rotation):</strong>{' '}
+                    <strong>
+                      Automatyczna zamiana aktywów (Asset Rotation):
+                    </strong>{' '}
                     Pozwól Agentowi AI sprzedawać słabsze aktywa i kupować za nie
                     instrumenty o wyższym prawdopodobieństwie zysku
                   </span>
@@ -1967,7 +2568,7 @@ export default function AutoTradingPanels({
                     type="checkbox"
                     checked={aiSettings.executeRealOrders}
                     onChange={(e) =>
-                      setAiSettings((prev) => ({
+                      updateAiSettingsAndSync((prev) => ({
                         ...prev,
                         executeRealOrders: e.target.checked,
                       }))
@@ -1982,26 +2583,29 @@ export default function AutoTradingPanels({
 
             {/* Right Column: Live AI Radar (Top Opportunities & Active AI Holdings) */}
             <div className="auto-rules-box">
-              <div className="box-subheader">
+              <div className="box-title">
                 <Sparkles size={15} />
-                <h4>
-                  Radar Okazji Agenta AI ({aiLiveStatus.scannedCount} przeskanowanych
-                  rynków) oraz Aktywne Pozycje AI
-                </h4>
+                <span>
+                  Radar Okazji Agenta AI ({aiLiveStatus.scannedCount}{' '}
+                  przeskanowanych rynków) oraz Aktywne Pozycje AI
+                </span>
               </div>
 
               {/* Active AI Holdings */}
-              <div className="ai-section-block">
-                <div className="ai-block-title">
-                  <span>
+              <div className="tracked-positions-mini">
+                <div className="tracked-header">
+                  <strong>
                     Aktywne aktywa pod nadzorem AI ({aiTrackedHoldings.length} /{' '}
                     {aiSettings.maxConcurrentHoldings})
-                  </span>
+                  </strong>
                   {aiTrackedHoldings.length > 0 && (
                     <button
                       type="button"
                       className="text-link-btn"
-                      onClick={() => setAiTrackedHoldings([])}
+                      onClick={() => {
+                        setAiTrackedHoldings([]);
+                        publishCrossDeviceState({ aiTrackedHoldings: [] });
+                      }}
                     >
                       Wyczyść listę śledzenia
                     </button>
@@ -2009,92 +2613,96 @@ export default function AutoTradingPanels({
                 </div>
 
                 {aiTrackedHoldings.length === 0 ? (
-                  <div className="ai-empty-note">
+                  <div className="min-sz-hint">
                     Brak otwartych pozycji AI. Włącz Agenta AI lub kliknij
                     „Skanuj i wykonaj ruch AI”, aby Agent znalazł pierwszą okazję.
                   </div>
                 ) : (
-                  <div className="ai-holdings-list">
-                    {aiTrackedHoldings.map((h) => (
-                      <div key={h.instId} className="ai-holding-row">
-                        <div>
-                          <strong
-                            style={{ cursor: 'pointer', color: '#60a5fa' }}
-                            onClick={() =>
-                              onSelectInstrument &&
-                              onSelectInstrument(h.instId, h.instType)
-                            }
-                          >
-                            {h.instId}
-                          </strong>
-                          <small>
-                            {' '}
-                            • Ilość: {Number(h.qty).toFixed(4)} {h.baseCcy} •
-                            Wejście: {h.entryPrice}
-                          </small>
-                        </div>
-                        <span className="ai-score-tag">
-                          Score wejścia: {h.entryScore}/100
-                        </span>
+                  aiTrackedHoldings.map((h) => (
+                    <div key={h.instId} className="tracked-row">
+                      <div>
+                        <strong
+                          style={{ cursor: 'pointer', color: '#60a5fa' }}
+                          onClick={() =>
+                            onSelectInstrument &&
+                            onSelectInstrument(h.instId, h.instType)
+                          }
+                        >
+                          {h.instId}
+                        </strong>
+                        <small>
+                          {' '}
+                          • Ilość: {Number(h.qty).toFixed(4)} {h.baseCcy} •
+                          Wejście: {h.entryPrice}
+                        </small>
                       </div>
-                    ))}
-                  </div>
+                      <span className="rule-badge">
+                        Score: {h.entryScore}/100
+                      </span>
+                    </div>
+                  ))
                 )}
               </div>
 
               {/* Top Scanned Market Opportunities */}
-              <div className="ai-section-block">
-                <div className="ai-block-title">
-                  <span>
-                    Najlepsze wykryte okazje rynkowe na żywo (Top AI Opportunity Score)
-                  </span>
-                </div>
-
-                {aiLiveStatus.topOpportunities.length === 0 ? (
-                  <div className="ai-empty-note">
-                    Kliknij „Skanuj i wykonaj ruch AI” lub aktywuj Agenta AI, aby
-                    zobaczyć ranking najbardziej opłacalnych rynków.
-                  </div>
-                ) : (
-                  <div className="ai-opportunities-list">
-                    {aiLiveStatus.topOpportunities.map((opp) => (
-                      <div
-                        key={opp.instId}
-                        className="ai-opp-card"
-                        onClick={() =>
-                          onSelectInstrument &&
-                          onSelectInstrument(opp.instId, opp.instType)
-                        }
-                      >
-                        <div className="ai-opp-top">
-                          <div>
-                            <strong>{opp.instId}</strong>
-                            <span className="mini-type-tag">
-                              {opp.categoryTag}
-                            </span>
-                          </div>
-                          <span className="ai-score-badge">
-                            AI Score: {opp.score}/100
-                          </span>
-                        </div>
-                        <div className="ai-opp-meta">
-                          <span>Cena: {opp.lastPrice}</span>
-                          <span
-                            className={
-                              opp.change24hPct >= 0 ? 'pos-text' : 'neg-text'
-                            }
-                          >
-                            24h: {opp.change24hPct >= 0 ? '+' : ''}
-                            {opp.change24hPct.toFixed(2)}%
-                          </span>
-                          <span>Sygnał: {opp.signalType}</span>
-                        </div>
-                        <div className="ai-opp-reason">{opp.reasonText}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+              <div className="box-title" style={{ marginTop: '6px' }}>
+                <TrendingUp size={15} />
+                <span>
+                  Najlepsze wykryte okazje rynkowe na żywo (Top AI Opportunity
+                  Score)
+                </span>
               </div>
+
+              {aiLiveStatus.topOpportunities.length === 0 ? (
+                <div className="empty-list-msg">
+                  Kliknij „Skanuj i wykonaj ruch AI” lub aktywuj Agenta AI, aby
+                  zobaczyć ranking najbardziej opłacalnych rynków.
+                </div>
+              ) : (
+                <div className="ai-opportunities-list">
+                  {aiLiveStatus.topOpportunities.map((opp, idx) => (
+                    <div
+                      key={opp.instId}
+                      className="ai-opp-card"
+                      style={{ cursor: 'pointer' }}
+                      onClick={() =>
+                        onSelectInstrument &&
+                        onSelectInstrument(opp.instId, opp.instType)
+                      }
+                    >
+                      <div className="ai-opp-main">
+                        <div className="ai-opp-title">
+                          <span className="ai-rank">#{idx + 1}</span>
+                          <strong>{opp.instId}</strong>
+                          <span className="mini-type-tag">
+                            {opp.categoryTag}
+                          </span>
+                        </div>
+                        <span
+                          className={`ai-score-pill ${
+                            opp.score >= 70 ? 'high' : 'mid'
+                          }`}
+                        >
+                          AI Score: {opp.score}/100
+                        </span>
+                      </div>
+                      <div className="ai-opp-meta">
+                        <span>Cena: {opp.lastPrice}</span>
+                        <span
+                          className={
+                            opp.change24hPct >= 0 ? 'pos-text' : 'neg-text'
+                          }
+                        >
+                          24h: {opp.change24hPct >= 0 ? '+' : ''}
+                          {opp.change24hPct.toFixed(2)}%
+                        </span>
+                        <span>Sygnał: {opp.signalType}</span>
+                      </div>
+                      <div className="min-sz-hint">{opp.reasonText}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -2105,22 +2713,26 @@ export default function AutoTradingPanels({
           ==================================================================== */}
       {activeSubTab === 'history' && (
         <div className="auto-module-body">
-          <div className="orders-header" style={{ marginBottom: '10px' }}>
+          <div className="history-toolbar">
             <div>
-              <h3>
-                Historia Działań Automatycznego Handlu, Zamian Aktywów i Decyzji Agenta AI
-              </h3>
-              <span className="card-hint">
-                Rejestr wszystkich zakupów, realizacji profitów (Take Profit) oraz
-                rotacji między aktywami
-              </span>
+              <strong style={{ color: 'var(--text-primary)' }}>
+                Historia Działań Automatycznego Handlu, Zamian Aktywów i Decyzji
+                Agenta AI
+              </strong>
+              <div>
+                Rejestr wszystkich zakupów, realizacji profitów (Take Profit)
+                oraz rotacji między aktywami
+              </div>
             </div>
 
             {actionHistory.length > 0 && (
               <button
                 type="button"
                 className="secondary-sm-btn"
-                onClick={() => setActionHistory([])}
+                onClick={() => {
+                  setActionHistory([]);
+                  publishCrossDeviceState({ actionHistory: [] });
+                }}
               >
                 <Trash2 size={13} />
                 Wyczyść historię
@@ -2131,7 +2743,8 @@ export default function AutoTradingPanels({
           {actionHistory.length === 0 ? (
             <div className="orders-empty">
               Brak zapisanych działań. Uruchom Automatyczny Handel lub aktywuj
-              Agenta AI, aby rejestrować transakcje, zamiany aktywów i zebrane profity.
+              Agenta AI, aby rejestrować transakcje, zamiany aktywów i zebrane
+              profity.
             </div>
           ) : (
             <div className="table-responsive">
