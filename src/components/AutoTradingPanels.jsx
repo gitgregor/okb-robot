@@ -747,6 +747,8 @@ export default function AutoTradingPanels({
     let sumCurrentActiveEntryValUsdc = 0;
     let sumCurrentActiveMarketValUsdc = 0;
     let sumSoldValUsdc = 0;
+    let sumSoldCostValUsdc = 0;
+    let sumTotalWalletValUsdc = 0;
     let sumRemainingToChooseValUsdc = 0;
     let sumRealizedPnlUsdc = 0;
     let sumUnrealizedPnlUsdc = 0;
@@ -760,7 +762,7 @@ export default function AutoTradingPanels({
       );
       const activeBucket = activeByCcy.get(ccy);
       const histBucket = histMap.get(ccy);
-      const livePxUsdc = resolveLivePxUsdc(ccy) || 0;
+      const livePxUsdc = resolveLivePxUsdc(ccy) || (isStableQuote ? 1 : 0);
 
       // Wallet available quantity
       let walletAvailQty = wDetail
@@ -834,19 +836,22 @@ export default function AutoTradingPanels({
         );
       }
 
+      const walletTotalQty = walletAvailQty + walletFrozenQty;
       const remainingToChooseValUsdc =
         remainingToChooseQty * (livePxUsdc || (isStableQuote ? 1 : 0));
       const walletTotalValUsdc =
-        walletAvailQty * (livePxUsdc || (isStableQuote ? 1 : 0));
+        walletTotalQty * (livePxUsdc || (isStableQuote ? 1 : 0));
 
       if (!isStableQuote || takenQty > 0) {
         sumTakenBoughtValUsdc += totalBoughtValUsdc;
         sumCurrentActiveEntryValUsdc += activeEntryValUsdc;
         sumCurrentActiveMarketValUsdc += activeCurrentValUsdc;
         sumSoldValUsdc += totalSoldValUsdc;
+        sumSoldCostValUsdc += histSoldCostUsdc;
         sumRealizedPnlUsdc += histRealizedPnl;
         sumUnrealizedPnlUsdc += unrealizedPnlUsdc;
       }
+      sumTotalWalletValUsdc += walletTotalValUsdc;
       sumRemainingToChooseValUsdc += remainingToChooseValUsdc;
 
       const rowObj = {
@@ -855,8 +860,10 @@ export default function AutoTradingPanels({
           activeBucket?.instId ||
           histBucket?.lastInstId ||
           (isStableQuote ? `${ccy}-USDC` : `${ccy}-USDC`),
+        activeInstId: activeBucket?.instId || null,
         instType: activeBucket?.instType || 'SPOT',
         isStableQuote,
+        inWallet: Boolean(wDetail) || walletTotalQty > 0,
         inRealWallet: Boolean(wDetail),
         isSelectedForAi: aiSettings.selectedWalletAsset === ccy,
         statusLabel:
@@ -869,8 +876,10 @@ export default function AutoTradingPanels({
             : '⚪ Obserwowane',
         livePxUsdc,
         livePxVal: toValCcy(livePxUsdc),
+        livePriceVal: toValCcy(livePxUsdc),
         walletAvailQty,
         walletFrozenQty,
+        walletTotalQty,
         walletTotalVal: toValCcy(walletTotalValUsdc),
         takenQty,
         activeQty,
@@ -915,15 +924,20 @@ export default function AutoTradingPanels({
       return b.walletTotalVal - a.walletTotalVal;
     });
 
+    const convFactor = valuationCcy === 'USDG' ? 1 / usdgRateInUsdc : 1;
+
     const summary = {
       valuationCcy,
       usdgRateInUsdc,
+      convFactor,
       selectedWalletAsset: aiSettings.selectedWalletAsset || 'ALL',
       walletAllocationPct: aiSettings.walletAllocationPct || '100',
       totalTakenBoughtVal: toValCcy(sumTakenBoughtValUsdc),
       currentInTradeEntryVal: toValCcy(sumCurrentActiveEntryValUsdc),
       currentInTradeMarketVal: toValCcy(sumCurrentActiveMarketValUsdc),
       totalSoldVal: toValCcy(sumSoldValUsdc),
+      totalSoldCostVal: toValCcy(sumSoldCostValUsdc),
+      totalWalletVal: toValCcy(sumTotalWalletValUsdc),
       totalRemainingToChooseVal: toValCcy(sumRemainingToChooseValUsdc),
       realizedPnlVal: toValCcy(sumRealizedPnlUsdc),
       unrealizedPnlVal: toValCcy(sumUnrealizedPnlUsdc),
