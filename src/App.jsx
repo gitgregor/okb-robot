@@ -24,6 +24,8 @@ import {
   Cpu,
   BarChart2,
   Grid,
+  Maximize2,
+  Minimize2,
 } from 'lucide-react';
 import {
   OKX_REGIONS,
@@ -201,6 +203,7 @@ export default function App() {
   });
   const [showOrdersSplitModal, setShowOrdersSplitModal] = useState(false);
   const [ordersSplitView, setOrdersSplitView] = useState('both'); // 'both' | 'open' | 'executed'
+  const [isWalletFullscreen, setIsWalletFullscreen] = useState(false);
 
   // Order Form State
   const [side, setSide] = useState('buy'); // 'buy' | 'sell'
@@ -1880,13 +1883,29 @@ export default function App() {
         </section>
 
         {/* Column 4: Account Balances (Portfel Handlowy + Live AI Asset Status) */}
-        <section className="card balance-card">
+        <section
+          className={`card balance-card ${
+            isWalletFullscreen ? 'wallet-fullscreen-mode' : ''
+          }`}
+        >
           <div className="card-header">
             <div className="header-with-icon">
               <Wallet size={17} />
-              <h2>Portfel Handlowy</h2>
+              <h2>
+                Portfel Handlowy{' '}
+                {isWalletFullscreen && (
+                  <span className="wallet-fs-badge">TRYB PEŁNOEKRANOWY</span>
+                )}
+              </h2>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                flexWrap: 'wrap',
+              }}
+            >
               {automationBook.assetSummary && (
                 <div className="unit-switch mini-ccy-switch">
                   <button
@@ -1922,6 +1941,30 @@ export default function App() {
                   </button>
                 </div>
               )}
+              <button
+                type="button"
+                className={`wallet-fullscreen-toggle-btn ${
+                  isWalletFullscreen ? 'active-fs' : ''
+                }`}
+                onClick={() => setIsWalletFullscreen((prev) => !prev)}
+                title={
+                  isWalletFullscreen
+                    ? 'Powróć do standardowego widoku Portfela Handlowego'
+                    : 'Wyświetl Portfel Handlowy na całym ekranie'
+                }
+              >
+                {isWalletFullscreen ? (
+                  <>
+                    <Minimize2 size={14} />
+                    <span>Powrót do wersji standardowej</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 size={14} />
+                    <span>Na cały ekran</span>
+                  </>
+                )}
+              </button>
               <button
                 type="button"
                 className="icon-refresh-btn"

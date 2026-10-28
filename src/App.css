@@ -3273,4 +3273,120 @@ body {
   }
 }
 
+/* =========================================================
+   PORTFEL HANDLOWY FULLSCREEN MODE & TOGGLE BUTTON
+   ========================================================= */
+.wallet-fullscreen-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(56, 189, 248, 0.5);
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+  font-size: 0.73rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.wallet-fullscreen-toggle-btn:hover {
+  background: #0284c7;
+  color: #ffffff;
+  border-color: #38bdf8;
+}
+
+.wallet-fullscreen-toggle-btn.active-fs {
+  background: linear-gradient(135deg, #2563eb, #0284c7);
+  color: #ffffff;
+  border-color: #60a5fa;
+  padding: 7px 14px;
+  font-size: 0.8rem;
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.35);
+}
+
+.wallet-fs-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 0.68rem;
+  font-weight: 800;
+  background: rgba(56, 189, 248, 0.2);
+  color: #38bdf8;
+  vertical-align: middle;
+}
+
+.balance-card.wallet-fullscreen-mode {
+  position: fixed;
+  inset: 0;
+  z-index: 2600;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border-radius: 0;
+  padding: 20px 28px;
+  background: rgba(8, 12, 20, 0.98);
+  backdrop-filter: blur(10px);
+  overflow-y: auto;
+  display: flex !important;
+  flex-direction: column;
+}
+
+.balance-card.wallet-fullscreen-mode .card-header {
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.balance-card.wallet-fullscreen-mode .card-header h2 {
+  font-size: 1.25rem;
+}
+
+.balance-card.wallet-fullscreen-mode .equity-box {
+  padding: 16px 20px;
+  margin-bottom: 14px;
+}
+
+.balance-card.wallet-fullscreen-mode .equity-value {
+  font-size: 1.75rem;
+}
+
+.balance-card.wallet-fullscreen-mode .wallet-live-summary-grid {
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.balance-card.wallet-fullscreen-mode .wallet-summary-mini-item {
+  padding: 12px 16px;
+  font-size: 0.82rem;
+}
+
+.balance-card.wallet-fullscreen-mode .wallet-summary-mini-item strong {
+  font-size: 1.15rem;
+}
+
+.balance-card.wallet-fullscreen-mode .asset-list-header {
+  font-size: 0.82rem;
+  padding: 10px 14px;
+}
+
+.balance-card.wallet-fullscreen-mode .asset-list {
+  max-height: none;
+  flex: 1;
+}
+
+.balance-card.wallet-fullscreen-mode .asset-row-enriched {
+  padding: 12px 14px !important;
+  font-size: 0.9rem;
+}
+
+.balance-card.wallet-fullscreen-mode .wallet-mini-action-btn {
+  padding: 5px 10px;
+  font-size: 0.75rem;
+}
+
 
