@@ -1557,3 +1557,96 @@ export async function fetchOrderHistory(credentials, instType = 'SPOT') {
     credentials,
   });
 }
+
+const BAR_MS_MAP = {
+  '1m': 60 * 1000,
+  '5m': 5 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
+  '1H': 60 * 60 * 1000,
+  '4H': 4 * 60 * 60 * 1000,
+  '1D': 24 * 60 * 60 * 1000,
+};
+
+function generateSyntheticCandles(instId, bar = '15m', limit = 60, currentLastPx = 0) {
+  const synth = SYNTHETIC_TICKERS_MAP.get(instId);
+  const basePx =
+    currentLastPx > 0
+      ? currentLastPx
+      : synth
+      ? parseFloat(synth.last || '10')
+      : 10;
+  const stepMs = BAR_MS_MAP[bar] || 15 * 60 * 1000;
+  const now = Date.now();
+  const seedBase = instId
+    .split('')
+    .reduce((acc, ch, i) => acc + ch.charCodeAt(0) * (i + 1), 0);
+
+  const candles = [];
+  let runningClose = basePx;
+
+  // Build backwards from current price so the latest candle matches live price
+  for (let i = 0; i < limit; i++) {
+    const ts = now - i * stepMs;
+    const wave1 = Math.sin((i + seedBase) * 0.43) * 0.0045;
+    const wave2 = Math.cos((i * 1.7 + seedBase) * 0.29) * 0.003;
+    const deltaPct = wave1 + wave2;
+    const close = runningClose;
+    const open = close / (1 + deltaPct);
+    const spread = Math.max(Math.abs(close - open), close * 0.0022);
+    const high = Math.max(open, close) + spread * (0.4 + ((i + seedBase) % 5) * 0.15);
+    const low = Math.min(open, close) - spread * (0.35 + ((i * 3 + seedBase) % 5) * 0.14);
+    const vol = (1200 + ((i * 97 + seedBase * 13) % 8500)) * (10 / Math.max(basePx, 0.1));
+
+    candles.push({
+      ts,
+      open,
+      high,
+      low,
+      close,
+      vol,
+    });
+    runningClose = open;
+  }
+
+  return candles.reverse();
+}
+
+/**
+ * Fetch candlestick (OHLCV) history for any OKX instrument with fallback for Pre-Market / xStocks / offline.
+ * Returns chronological array (oldest -> newest) of { ts, open, high, low, close, vol }.
+ */
+export async function fetchCandles(
+  instId,
+  bar = '15m',
+  limit = 64,
+  region = 'global',
+  currentLastPx = 0
+) {
+  if (!instId) return [];
+  try {
+    const raw = await okxRequest({
+      method: 'GET',
+      requestPath: `/api/v5/market/candles?instId=${encodeURIComponent(
+        instId
+      )}&bar=${encodeURIComponent(bar)}&limit=${limit}`,
+      regionOverride: region,
+    });
+    if (Array.isArray(raw) && raw.length > 0) {
+      // OKX returns newest first: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+      return raw
+        .map((row) => ({
+          ts: Number(row[0]),
+          open: parseFloat(row[1]),
+          high: parseFloat(row[2]),
+          low: parseFloat(row[3]),
+          close: parseFloat(row[4]),
+          vol: parseFloat(row[5] || '0'),
+        }))
+        .reverse();
+    }
+  } catch {
+    // Fallback to synthetic OHLCV when pair is Pre-Market / xStock synthetic or regional endpoint blocks
+  }
+  return generateSyntheticCandles(instId, bar, limit, currentLastPx);
+}
+

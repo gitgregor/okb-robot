@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Bot,
   Cpu,
@@ -19,6 +19,8 @@ import {
   Coins,
   Zap,
   Smartphone,
+  Wallet,
+  Layers,
 } from 'lucide-react';
 import {
   fetchAllInstruments,
@@ -136,7 +138,7 @@ export const AUTO_TRADING_RULES_CATALOG = [
     name: '4. Smart DCA + Auto-Take Profit (Uśrednianie Ceny z Kumulacją Zysku)',
     badge: 'Bezpieczna akumulacja',
     whatItDoes:
-      'Dokupuje aktywo partiami podczas głębszych korekt (obniżając średnią cenę zakupu) i automatycznie sprzedaje całość z zyskiem, gdy tylko rynek odbije powyżej uśrednionej ceny wejścia.',
+      'Dokupuje aktywo partiami podczas głębszych korekt (obniżając średnią cenę zakupu) i automatycznie sprzedaje całość z zyskiem, gdy tylko rynek odbije powyżej uśrednionej cenę wejścia.',
     howItWorks:
       'Zamiast kupować za całą kwotę w jednym punkcie, bot otwiera pierwszą transzę, a w razie dalszego spadku kursu o kolejny krok (%) dokupuje następną transzę (do ustalonego limitu transakcji). Dzięki temu średnia cena zakupu (Avg Entry) obniża się. Gdy kurs rynkowy przekroczy tę uśrednioną cenę o zadany "Take Profit (%)", bot sprzedaje zgromadzone jednostki i realizuje skumulowany zysk.',
   },
@@ -147,10 +149,12 @@ export default function AutoTradingPanels({
   instType,
   ticker,
   orderBook,
+  allTickersMap = {},
   credentials,
   hasCredentials,
   accountBalance,
   onSelectInstrument,
+  onOpenChart,
   onRefreshPrivateData,
   onSyncAutomationBook,
   autoBotEnabled,
@@ -173,8 +177,10 @@ export default function AutoTradingPanels({
   const isApplyingRemoteRef = useRef(false);
   const unsupportedInstRef = useRef(new Map());
 
-  // Sub-tab inside the Automation Center ('autobot' | 'ai_agent' | 'history')
-  const [activeSubTab, setActiveSubTab] = useState('autobot');
+  // Sub-tab inside the Automation Center ('autobot' | 'ai_agent' | 'asset_status' | 'history')
+  const [activeSubTab, setActiveSubTab] = useState('ai_agent');
+  const [closingPositionId, setClosingPositionId] = useState(null);
+  const [isClosingAllPositions, setIsClosingAllPositions] = useState(false);
   const [syncStatus, setSyncStatus] = useState({
     connected: false,
     lastSyncTime: null,
@@ -232,14 +238,11 @@ export default function AutoTradingPanels({
   // MODULE 2: AUTONOMOUS MULTI-MARKET AI AGENT STATE
   // ============================================================================
   const [aiSettings, setAiSettings] = useState(() => {
-    try {
-      const saved = localStorage.getItem(AI_SETTINGS_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch {
-      // ignore
-    }
-    return {
-      tradeBudgetUsdt: '20', // Kwota na pojedynczą okazję (USDT/USDC)
+    const defaults = {
+      selectedWalletAsset: 'ALL', // 'ALL' (wszystkie z portfela) lub konkretne aktywo z Portfela Handlowego (np. 'USDC', 'USDG', 'ONDO', 'BTC'...)
+      walletAllocationPct: '100', // Ile % wybranego aktywa z portfela przeznaczyć do handlu AI
+      summaryValuationCcy: 'USDC', // 'USDC' (domyślnie) | 'USDG'
+      tradeBudgetUsdt: '20', // Kwota na pojedynczą okazję (USDC/USDG/USDT)
       maxConcurrentHoldings: '4',
       targetProfitPct: '1.1',
       stopLossPct: '1.8',
@@ -256,6 +259,23 @@ export default function AutoTradingPanels({
       },
       executeRealOrders: true,
     };
+    try {
+      const saved = localStorage.getItem(AI_SETTINGS_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          ...defaults,
+          ...parsed,
+          summaryValuationCcy:
+            parsed.summaryValuationCcy === 'USDG' ? 'USDG' : 'USDC',
+          selectedWalletAsset: parsed.selectedWalletAsset || 'ALL',
+          walletAllocationPct: parsed.walletAllocationPct || '100',
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return defaults;
   });
 
   const [aiTrackedHoldings, setAiTrackedHoldings] = useState(() => {
@@ -362,8 +382,584 @@ export default function AutoTradingPanels({
     }
   }, [actionHistory]);
 
-  // Report active positions, pending TP/SL target orders, and executed order history up to App.jsx
-  // so the bottom panel ("Otwarte Pozycje", "Otwarte Zlecenia", "Historia Zleceń") is always populated!
+  const emergencyHandlersRef = useRef({
+    closeSingle: null,
+    closeAll: null,
+    selectWalletAsset: null,
+    takeWalletAsset: null,
+    setValuationCcy: null,
+  });
+
+  // ============================================================================
+  // LIVE ASSET STATUS LEDGER & VALUATION ENGINE (USDC / USDG)
+  // Tracks for every wallet & traded asset:
+  // - how much was taken to trade (takenQty & activeQty)
+  // - for how much it was bought (avgBuyPrice & totalBoughtVal)
+  // - for how much it was sold (soldQty, avgSellPrice & totalSoldVal)
+  // - how much remains to choose in the wallet (remainingQty & remainingVal)
+  // All summarized in USDC (default) or USDG!
+  // ============================================================================
+  const assetLedgerAndSummary = useMemo(() => {
+    const valuationCcy =
+      aiSettings.summaryValuationCcy === 'USDG' ? 'USDG' : 'USDC';
+
+    // Determine live USDG <-> USDC rate from OKX tickers (defaults to 1.0000 parity)
+    const rawUsdgPx = parseFloat(
+      allTickersMap?.['USDG-USDC']?.last ||
+        allTickersMap?.['USDG-USDT']?.last ||
+        '1'
+    );
+    const usdgRateInUsdc =
+      !Number.isNaN(rawUsdgPx) && rawUsdgPx > 0.5 && rawUsdgPx < 1.5
+        ? rawUsdgPx
+        : 1.0;
+
+    const toValCcy = (valUsdc) => {
+      const num = Number(valUsdc || 0);
+      if (Number.isNaN(num)) return 0;
+      return valuationCcy === 'USDG' ? num / usdgRateInUsdc : num;
+    };
+
+    const resolveLivePxUsdc = (ccy) => {
+      if (!ccy) return 0;
+      const sym = String(ccy).toUpperCase();
+      if (sym === 'USDC' || sym === 'USDT' || sym === 'USD') return 1.0;
+      if (sym === 'USDG') return usdgRateInUsdc;
+      if (sym === 'EUR') {
+        const eurTk =
+          allTickersMap?.['EUR-USDC']?.last ||
+          allTickersMap?.['EUR-USDT']?.last;
+        return eurTk && parseFloat(eurTk) > 0 ? parseFloat(eurTk) : 1.08;
+      }
+      if (instId?.startsWith(`${sym}-`) && ticker?.last) {
+        const p = parseFloat(ticker.last);
+        if (p > 0) return p;
+      }
+      const directTk =
+        allTickersMap?.[`${sym}-USDC`]?.last ||
+        allTickersMap?.[`${sym}-USDT`]?.last ||
+        allTickersMap?.[`${sym}-USDG`]?.last ||
+        allTickersMap?.[`${sym}-USDT-SWAP`]?.last;
+      if (directTk && parseFloat(directTk) > 0) {
+        return parseFloat(directTk);
+      }
+      const oppMatch = aiLiveStatus.topOpportunities?.find(
+        (o) => o.baseCcy === sym
+      );
+      if (oppMatch?.lastPrice > 0) return Number(oppMatch.lastPrice);
+
+      const holdMatch = aiTrackedHoldings.find(
+        (h) => (h.baseCcy || h.instId?.split('-')[0]) === sym
+      );
+      if (holdMatch?.currentPrice > 0) return Number(holdMatch.currentPrice);
+      if (holdMatch?.entryPrice > 0) return Number(holdMatch.entryPrice);
+
+      const walDetail = accountBalance?.details?.find((d) => d.ccy === sym);
+      if (walDetail) {
+        const av = parseFloat(walDetail.availBal || walDetail.eq || '0');
+        const eqU = parseFloat(walDetail.eqUsd || '0');
+        if (av > 0 && eqU > 0) return eqU / av;
+      }
+      return 0;
+    };
+
+    // 1. Aggregate historical BUY / SELL / SWAP records per asset from actionHistory
+    const histMap = new Map();
+    const ensureHist = (sym) => {
+      const clean = String(sym || '').trim().toUpperCase();
+      if (!clean || clean === '—') return null;
+      if (!histMap.has(clean)) {
+        histMap.set(clean, {
+          ccy: clean,
+          boughtQty: 0,
+          boughtValUsdc: 0,
+          soldQty: 0,
+          soldValUsdc: 0,
+          soldCostUsdc: 0,
+          realizedPnlUsdc: 0,
+          tradesCount: 0,
+          lastInstId: `${clean}-USDC`,
+        });
+      }
+      return histMap.get(clean);
+    };
+
+    for (const item of actionHistory) {
+      if (!item || item.actionType === 'ERROR') continue;
+
+      if (item.swapSell && item.swapBuy) {
+        const sEntry = ensureHist(item.swapSell.baseCcy);
+        if (sEntry) {
+          const sQty = Number(item.swapSell.qty || 0);
+          const sVal = Number(item.swapSell.sellValUsd || 0);
+          const sCost = Number(item.swapSell.buyValUsd || sVal);
+          sEntry.soldQty += sQty;
+          sEntry.soldValUsdc += sVal;
+          sEntry.soldCostUsdc += sCost;
+          sEntry.realizedPnlUsdc += Number(item.profitUsd || 0);
+          sEntry.tradesCount += 1;
+          if (item.swapSell.instId) sEntry.lastInstId = item.swapSell.instId;
+        }
+        const bEntry = ensureHist(item.swapBuy.baseCcy);
+        if (bEntry) {
+          const bQty = Number(item.swapBuy.qty || 0);
+          const bVal = Number(item.swapBuy.buyValUsd || 0);
+          bEntry.boughtQty += bQty;
+          bEntry.boughtValUsdc += bVal;
+          bEntry.tradesCount += 1;
+          if (item.swapBuy.instId) bEntry.lastInstId = item.swapBuy.instId;
+        }
+        continue;
+      }
+
+      const sideUpper = String(item.side || '').toUpperCase();
+      if (
+        item.actionType === 'AI_ASSET_SWAP' ||
+        sideUpper.includes('SWAP') ||
+        String(item.amountStr || '').includes('➔')
+      ) {
+        const amtParts = String(item.amountStr || '').split('➔');
+        const pxParts = String(item.priceStr || '').split('➔');
+        if (amtParts.length === 2) {
+          const leftMatch = amtParts[0]
+            .trim()
+            .match(/([0-9.]+)\s*([A-Z0-9]+)/i);
+          const rightMatch = amtParts[1]
+            .trim()
+            .match(/([0-9.]+)\s*([A-Z0-9]+)/i);
+          const px1 = parseFloat((pxParts[0] || '').trim()) || 0;
+          const px2 = parseFloat((pxParts[1] || '').trim()) || 0;
+          const pnl =
+            typeof item.profitUsd === 'number' ? item.profitUsd : 0;
+
+          if (leftMatch) {
+            const q1 = parseFloat(leftMatch[1]) || 0;
+            const c1 = leftMatch[2].toUpperCase();
+            const e1 = ensureHist(c1);
+            if (e1 && q1 > 0) {
+              const p1 = px1 || resolveLivePxUsdc(c1);
+              const val1 = q1 * p1;
+              e1.soldQty += q1;
+              e1.soldValUsdc += val1;
+              e1.soldCostUsdc += Math.max(0, val1 - pnl);
+              e1.realizedPnlUsdc += pnl;
+              e1.tradesCount += 1;
+            }
+          }
+          if (rightMatch) {
+            const q2 = parseFloat(rightMatch[1]) || 0;
+            const c2 = rightMatch[2].toUpperCase();
+            const e2 = ensureHist(c2);
+            if (e2 && q2 > 0) {
+              const p2 = px2 || resolveLivePxUsdc(c2);
+              const val2 = q2 * p2;
+              e2.boughtQty += q2;
+              e2.boughtValUsdc += val2;
+              e2.tradesCount += 1;
+            }
+          }
+        }
+        continue;
+      }
+
+      const baseSym =
+        item.rawBaseCcy ||
+        String(item.instId || '')
+          .split('-')[0]
+          .trim()
+          .toUpperCase();
+      const entry = ensureHist(baseSym);
+      if (!entry) continue;
+
+      if (item.instId && String(item.instId).includes('-')) {
+        entry.lastInstId = item.instId;
+      }
+
+      const parsedQty =
+        Number(item.rawQty || 0) ||
+        parseFloat(String(item.amountStr || '').replace(/[^0-9.]/g, '')) ||
+        0;
+      const parsedPx =
+        Number(item.rawPrice || 0) ||
+        parseFloat(String(item.priceStr || '').replace(/[^0-9.]/g, '')) ||
+        resolveLivePxUsdc(baseSym) ||
+        0;
+      const usdBracketMatch = String(item.amountStr || '').match(
+        /\$([0-9.]+)/
+      );
+      const parsedVal =
+        Number(item.rawQuoteVal || 0) ||
+        (usdBracketMatch ? parseFloat(usdBracketMatch[1]) : 0) ||
+        parsedQty * parsedPx;
+
+      if (sideUpper.includes('SELL')) {
+        const pnl =
+          typeof item.profitUsd === 'number' ? item.profitUsd : 0;
+        const costVal =
+          Number(item.rawCostVal || 0) || Math.max(0, parsedVal - pnl);
+        entry.soldQty += parsedQty;
+        entry.soldValUsdc += parsedVal;
+        entry.soldCostUsdc += costVal;
+        entry.realizedPnlUsdc += pnl;
+        entry.tradesCount += 1;
+      } else if (sideUpper.includes('BUY')) {
+        entry.boughtQty += parsedQty;
+        entry.boughtValUsdc += parsedVal;
+        entry.tradesCount += 1;
+      }
+    }
+
+    // 2. Collect active positions from AI Agent & Rule Auto-Bot
+    const activePairForBot = (
+      autoSettings.targetInstId ||
+      instId ||
+      'ONDO-USDC'
+    ).trim();
+    const botBaseCcy = activePairForBot.split('-')[0];
+
+    const activeByCcy = new Map();
+    const addActiveHold = (ccy, holdObj) => {
+      const sym = String(ccy || '').toUpperCase();
+      if (!sym) return;
+      if (!activeByCcy.has(sym)) {
+        activeByCcy.set(sym, {
+          activeQty: 0,
+          fromWalletQty: 0,
+          activeEntryValUsdc: 0,
+          activeCurrentValUsdc: 0,
+          simulatedEntryValUsdc: 0,
+          instId: holdObj.instId || `${sym}-USDC`,
+          instType: holdObj.instType || 'SPOT',
+          sources: new Set(),
+        });
+      }
+      const bucket = activeByCcy.get(sym);
+      const q = Number(holdObj.qty || 0);
+      const entPx = Number(holdObj.entryPrice || 0);
+      const curPx = Number(holdObj.currentPrice || entPx || 0);
+      bucket.activeQty += q;
+      if (holdObj.fromWallet) {
+        bucket.fromWalletQty += q;
+      }
+      bucket.activeEntryValUsdc += q * entPx;
+      bucket.activeCurrentValUsdc += q * curPx;
+      if (
+        !holdObj.fromWallet &&
+        !String(holdObj.executedVia || '').includes('API OKX')
+      ) {
+        bucket.simulatedEntryValUsdc += q * entPx;
+      }
+      if (holdObj.sourceLabel) bucket.sources.add(holdObj.sourceLabel);
+    };
+
+    if (
+      autoBotCycleState.openCyclesCount > 0 &&
+      autoBotCycleState.heldBaseQty > 0 &&
+      autoBotCycleState.avgEntryPrice > 0
+    ) {
+      const botLivePx =
+        activePairForBot === instId && ticker?.last
+          ? parseFloat(ticker.last)
+          : autoBotCycleState.referencePrice ||
+            autoBotCycleState.avgEntryPrice;
+      addActiveHold(botBaseCcy, {
+        instId: activePairForBot,
+        instType: activePairForBot.endsWith('-SWAP') ? 'SWAP' : 'SPOT',
+        qty: autoBotCycleState.heldBaseQty,
+        entryPrice: autoBotCycleState.avgEntryPrice,
+        currentPrice: botLivePx,
+        fromWallet: false,
+        executedVia: autoSettings.executeRealOrders && hasCredentials ? 'API OKX' : 'Symulacja',
+        sourceLabel: 'Auto-Bot',
+      });
+    }
+
+    for (const h of aiTrackedHoldings) {
+      const sym = h.baseCcy || h.instId?.split('-')[0];
+      const oppMatch = aiLiveStatus.topOpportunities?.find(
+        (o) => o.instId === h.instId
+      );
+      const livePx =
+        h.instId === instId && ticker?.last
+          ? parseFloat(ticker.last)
+          : allTickersMap?.[h.instId]?.last
+          ? parseFloat(allTickersMap[h.instId].last)
+          : oppMatch?.lastPrice || h.currentPrice || h.entryPrice;
+
+      addActiveHold(sym, {
+        instId: h.instId,
+        instType: h.instType || 'SPOT',
+        qty: Number(h.qty || 0),
+        entryPrice: Number(h.entryPrice || livePx),
+        currentPrice: Number(livePx || h.entryPrice),
+        fromWallet: Boolean(h.fromWallet),
+        executedVia: h.executedVia || 'AI',
+        sourceLabel: h.fromWallet ? 'Portfel ➔ AI' : 'Agent AI',
+      });
+    }
+
+    // 3. Build complete set of currencies from Wallet + Active Positions + Trade History
+    const allCcys = new Set();
+    const walletDetailsList = accountBalance?.details || [];
+    const hasRealWallet = walletDetailsList.length > 0;
+
+    for (const d of walletDetailsList) {
+      if (d?.ccy) allCcys.add(d.ccy.toUpperCase());
+    }
+    for (const sym of activeByCcy.keys()) {
+      allCcys.add(sym);
+    }
+    for (const sym of histMap.keys()) {
+      allCcys.add(sym);
+    }
+    if (
+      aiSettings.selectedWalletAsset &&
+      aiSettings.selectedWalletAsset !== 'ALL'
+    ) {
+      allCcys.add(aiSettings.selectedWalletAsset.toUpperCase());
+    }
+    if (!hasRealWallet) {
+      allCcys.add('USDC');
+      allCcys.add('USDG');
+    }
+
+    // Total simulated active cost committed from virtual quote wallet
+    let totalSimulatedActiveQuoteUsdc = 0;
+    for (const b of activeByCcy.values()) {
+      totalSimulatedActiveQuoteUsdc += b.simulatedEntryValUsdc;
+    }
+
+    let totalHistRealizedPnlUsdc = 0;
+    for (const h of histMap.values()) {
+      totalHistRealizedPnlUsdc += h.realizedPnlUsdc;
+    }
+
+    const defaultSimPoolUsdc = Math.max(
+      20,
+      parseInt(aiSettings.maxConcurrentHoldings || '4', 10) *
+        parseFloat(aiSettings.tradeBudgetUsdt || '20')
+    );
+
+    const ledgerRows = [];
+    const walletChoices = [];
+
+    let sumTakenBoughtValUsdc = 0;
+    let sumCurrentActiveEntryValUsdc = 0;
+    let sumCurrentActiveMarketValUsdc = 0;
+    let sumSoldValUsdc = 0;
+    let sumRemainingToChooseValUsdc = 0;
+    let sumRealizedPnlUsdc = 0;
+    let sumUnrealizedPnlUsdc = 0;
+
+    for (const ccy of allCcys) {
+      const isStableQuote = ['USDC', 'USDG', 'USDT', 'EUR', 'USD'].includes(
+        ccy
+      );
+      const wDetail = walletDetailsList.find(
+        (d) => d.ccy?.toUpperCase() === ccy
+      );
+      const activeBucket = activeByCcy.get(ccy);
+      const histBucket = histMap.get(ccy);
+      const livePxUsdc = resolveLivePxUsdc(ccy) || 0;
+
+      // Wallet available quantity
+      let walletAvailQty = wDetail
+        ? parseFloat(wDetail.availBal || '0')
+        : !hasRealWallet && ccy === 'USDC'
+        ? defaultSimPoolUsdc
+        : 0;
+      const walletFrozenQty = wDetail
+        ? parseFloat(wDetail.frozenBal || '0')
+        : 0;
+
+      const activeQty = activeBucket ? activeBucket.activeQty : 0;
+      const activeEntryValUsdc = activeBucket
+        ? activeBucket.activeEntryValUsdc
+        : 0;
+      const activeCurrentValUsdc = activeBucket
+        ? activeBucket.activeCurrentValUsdc
+        : 0;
+
+      const histBoughtQty = histBucket ? histBucket.boughtQty : 0;
+      const histBoughtValUsdc = histBucket ? histBucket.boughtValUsdc : 0;
+      const histSoldQty = histBucket ? histBucket.soldQty : 0;
+      const histSoldValUsdc = histBucket ? histBucket.soldValUsdc : 0;
+      const histSoldCostUsdc = histBucket ? histBucket.soldCostUsdc : 0;
+      const histRealizedPnl = histBucket ? histBucket.realizedPnlUsdc : 0;
+
+      // Total quantity of this asset taken to trade (active + sold)
+      const takenQty = Math.max(histBoughtQty, activeQty + histSoldQty);
+      // Total value bought (active entry cost + historical cost of sold units)
+      const totalBoughtValUsdc = Math.max(
+        histBoughtValUsdc,
+        activeEntryValUsdc + histSoldCostUsdc
+      );
+      const avgBuyPriceUsdc =
+        takenQty > 0
+          ? totalBoughtValUsdc / takenQty
+          : activeQty > 0
+          ? activeEntryValUsdc / activeQty
+          : livePxUsdc;
+
+      const soldQty = histSoldQty;
+      const totalSoldValUsdc = histSoldValUsdc;
+      const avgSellPriceUsdc = soldQty > 0 ? totalSoldValUsdc / soldQty : 0;
+
+      const unrealizedPnlUsdc =
+        activeQty > 0 ? activeCurrentValUsdc - activeEntryValUsdc : 0;
+      const totalAssetPnlUsdc = histRealizedPnl + unrealizedPnlUsdc;
+
+      // How much of this asset remains in the wallet to choose for new trading
+      let remainingToChooseQty = walletAvailQty;
+      if (!isStableQuote) {
+        // If asset is held on Spot wallet and tracked in active AI positions, deduct activeQty so we don't double-count
+        remainingToChooseQty = Math.max(0, walletAvailQty - activeQty);
+      } else if (ccy === 'USDC' && !hasRealWallet) {
+        remainingToChooseQty = Math.max(
+          0,
+          defaultSimPoolUsdc +
+            totalHistRealizedPnlUsdc -
+            totalSimulatedActiveQuoteUsdc
+        );
+        walletAvailQty = remainingToChooseQty;
+      } else if (
+        (ccy === 'USDC' || ccy === 'USDG' || ccy === 'USDT') &&
+        totalSimulatedActiveQuoteUsdc > 0 &&
+        (aiSettings.selectedWalletAsset === ccy ||
+          (aiSettings.selectedWalletAsset === 'ALL' && ccy === 'USDC'))
+      ) {
+        remainingToChooseQty = Math.max(
+          0,
+          walletAvailQty - totalSimulatedActiveQuoteUsdc
+        );
+      }
+
+      const remainingToChooseValUsdc =
+        remainingToChooseQty * (livePxUsdc || (isStableQuote ? 1 : 0));
+      const walletTotalValUsdc =
+        walletAvailQty * (livePxUsdc || (isStableQuote ? 1 : 0));
+
+      if (!isStableQuote || takenQty > 0) {
+        sumTakenBoughtValUsdc += totalBoughtValUsdc;
+        sumCurrentActiveEntryValUsdc += activeEntryValUsdc;
+        sumCurrentActiveMarketValUsdc += activeCurrentValUsdc;
+        sumSoldValUsdc += totalSoldValUsdc;
+        sumRealizedPnlUsdc += histRealizedPnl;
+        sumUnrealizedPnlUsdc += unrealizedPnlUsdc;
+      }
+      sumRemainingToChooseValUsdc += remainingToChooseValUsdc;
+
+      const rowObj = {
+        ccy,
+        instId:
+          activeBucket?.instId ||
+          histBucket?.lastInstId ||
+          (isStableQuote ? `${ccy}-USDC` : `${ccy}-USDC`),
+        instType: activeBucket?.instType || 'SPOT',
+        isStableQuote,
+        inRealWallet: Boolean(wDetail),
+        isSelectedForAi: aiSettings.selectedWalletAsset === ccy,
+        statusLabel:
+          activeQty > 0
+            ? '🟢 W handlu AI / Bot'
+            : soldQty > 0
+            ? '✅ Sprzedane (Zrealizowano)'
+            : walletAvailQty > 0
+            ? '💼 Dostępne w Portfelu'
+            : '⚪ Obserwowane',
+        livePxUsdc,
+        livePxVal: toValCcy(livePxUsdc),
+        walletAvailQty,
+        walletFrozenQty,
+        walletTotalVal: toValCcy(walletTotalValUsdc),
+        takenQty,
+        activeQty,
+        soldQty,
+        avgBuyPrice: toValCcy(avgBuyPriceUsdc),
+        totalBoughtVal: toValCcy(totalBoughtValUsdc),
+        activeEntryVal: toValCcy(activeEntryValUsdc),
+        activeCurrentVal: toValCcy(activeCurrentValUsdc),
+        avgSellPrice: toValCcy(avgSellPriceUsdc),
+        totalSoldVal: toValCcy(totalSoldValUsdc),
+        remainingToChooseQty,
+        remainingToChooseVal: toValCcy(remainingToChooseValUsdc),
+        realizedPnl: toValCcy(histRealizedPnl),
+        unrealizedPnl: toValCcy(unrealizedPnlUsdc),
+        totalPnl: toValCcy(totalAssetPnlUsdc),
+      };
+
+      ledgerRows.push(rowObj);
+      if (
+        wDetail ||
+        walletAvailQty > 0 ||
+        activeQty > 0 ||
+        ['USDC', 'USDG', 'USDT', 'ONDO', 'BTC', 'ETH', 'SOL'].includes(ccy)
+      ) {
+        walletChoices.push(rowObj);
+      }
+    }
+
+    // Sort ledger rows: active in trade first, then sold/traded, then by wallet value
+    ledgerRows.sort((a, b) => {
+      if ((a.activeQty > 0) !== (b.activeQty > 0)) {
+        return a.activeQty > 0 ? -1 : 1;
+      }
+      if ((a.takenQty > 0) !== (b.takenQty > 0)) {
+        return a.takenQty > 0 ? -1 : 1;
+      }
+      return b.remainingToChooseVal - a.remainingToChooseVal;
+    });
+
+    walletChoices.sort((a, b) => {
+      if (a.inRealWallet !== b.inRealWallet) return a.inRealWallet ? -1 : 1;
+      return b.walletTotalVal - a.walletTotalVal;
+    });
+
+    const summary = {
+      valuationCcy,
+      usdgRateInUsdc,
+      selectedWalletAsset: aiSettings.selectedWalletAsset || 'ALL',
+      walletAllocationPct: aiSettings.walletAllocationPct || '100',
+      totalTakenBoughtVal: toValCcy(sumTakenBoughtValUsdc),
+      currentInTradeEntryVal: toValCcy(sumCurrentActiveEntryValUsdc),
+      currentInTradeMarketVal: toValCcy(sumCurrentActiveMarketValUsdc),
+      totalSoldVal: toValCcy(sumSoldValUsdc),
+      totalRemainingToChooseVal: toValCcy(sumRemainingToChooseValUsdc),
+      realizedPnlVal: toValCcy(sumRealizedPnlUsdc),
+      unrealizedPnlVal: toValCcy(sumUnrealizedPnlUsdc),
+      totalCombinedPnlVal: toValCcy(sumRealizedPnlUsdc + sumUnrealizedPnlUsdc),
+      activeAssetsCount: ledgerRows.filter((r) => r.activeQty > 0).length,
+      tradedAssetsCount: ledgerRows.filter(
+        (r) => r.takenQty > 0 || r.soldQty > 0
+      ).length,
+    };
+
+    return {
+      ledgerRows,
+      walletChoices,
+      summary,
+    };
+  }, [
+    aiSettings.summaryValuationCcy,
+    aiSettings.selectedWalletAsset,
+    aiSettings.walletAllocationPct,
+    aiSettings.maxConcurrentHoldings,
+    aiSettings.tradeBudgetUsdt,
+    allTickersMap,
+    instId,
+    ticker,
+    aiLiveStatus.topOpportunities,
+    aiTrackedHoldings,
+    accountBalance?.details,
+    actionHistory,
+    autoSettings.targetInstId,
+    autoSettings.executeRealOrders,
+    autoBotCycleState,
+    hasCredentials,
+  ]);
+
+  // Report active positions, pending TP/SL target orders, executed order history, AND live Asset Ledger up to App.jsx
+  // so both the bottom panel and "Portfel Handlowy" are always updated in real time!
   useEffect(() => {
     if (!onSyncAutomationBook) return;
 
@@ -432,6 +1028,8 @@ export default function AutoTradingPanels({
       const livePx =
         h.instId === instId && ticker?.last
           ? parseFloat(ticker.last)
+          : allTickersMap?.[h.instId]?.last
+          ? parseFloat(allTickersMap[h.instId].last)
           : oppMatch?.lastPrice || h.currentPrice || h.entryPrice;
       const tpPx = (h.entryPrice * (1 + aiTpPct / 100)).toFixed(5);
       const slPx = (h.entryPrice * (1 - aiSlPct / 100)).toFixed(5);
@@ -498,6 +1096,18 @@ export default function AutoTradingPanels({
       activePositions: botPositions,
       pendingTargetOrders: pendingTargets,
       executedOrders: mappedOrders,
+      assetLedger: assetLedgerAndSummary.ledgerRows,
+      assetSummary: assetLedgerAndSummary.summary,
+      onEmergencyClosePosition: (id) =>
+        emergencyHandlersRef.current?.closeSingle?.(id),
+      onEmergencyCloseAllPositions: (stopAi) =>
+        emergencyHandlersRef.current?.closeAll?.(stopAi),
+      onSelectWalletAssetForAi: (ccy) =>
+        emergencyHandlersRef.current?.selectWalletAsset?.(ccy),
+      onTakeWalletAssetToAi: (ccy) =>
+        emergencyHandlersRef.current?.takeWalletAsset?.(ccy),
+      onChangeValuationCcy: (ccy) =>
+        emergencyHandlersRef.current?.setValuationCcy?.(ccy),
     });
   }, [
     onSyncAutomationBook,
@@ -509,6 +1119,8 @@ export default function AutoTradingPanels({
     aiSettings,
     instId,
     ticker,
+    allTickersMap,
+    assetLedgerAndSummary,
   ]);
 
   // ============================================================================
@@ -1140,6 +1752,12 @@ export default function AutoTradingPanels({
               actionType: 'TAKE_PROFIT',
               instId: targetPair,
               side: 'SELL',
+              rawBaseCcy: execRes.baseCcy,
+              rawQty: st.heldBaseQty,
+              rawPrice: lastPx,
+              rawQuoteVal: st.heldBaseQty * lastPx,
+              rawEntryPrice: st.avgEntryPrice,
+              rawCostVal: st.heldBaseQty * st.avgEntryPrice,
               amountStr: `${st.heldBaseQty.toFixed(4)} ${execRes.baseCcy}`,
               priceStr: `${lastPx}`,
               profitUsd,
@@ -1186,6 +1804,12 @@ export default function AutoTradingPanels({
               actionType: 'STOP_LOSS',
               instId: targetPair,
               side: 'SELL',
+              rawBaseCcy: execRes.baseCcy,
+              rawQty: st.heldBaseQty,
+              rawPrice: lastPx,
+              rawQuoteVal: st.heldBaseQty * lastPx,
+              rawEntryPrice: st.avgEntryPrice,
+              rawCostVal: st.heldBaseQty * st.avgEntryPrice,
               amountStr: `${st.heldBaseQty.toFixed(4)} ${execRes.baseCcy}`,
               priceStr: `${lastPx}`,
               profitUsd: lossUsd,
@@ -1321,6 +1945,10 @@ export default function AutoTradingPanels({
               actionType: 'BUY_RULE',
               instId: targetPair,
               side: 'BUY',
+              rawBaseCcy: execRes.baseCcy,
+              rawQty: execRes.baseQty,
+              rawPrice: lastPx,
+              rawQuoteVal: execRes.quoteVal,
               amountStr: `${execRes.baseQty.toFixed(4)} ${
                 execRes.baseCcy
               } ($${execRes.quoteVal.toFixed(2)})`,
@@ -1536,10 +2164,29 @@ export default function AutoTradingPanels({
         const region = credentials.region || 'global';
         const isDemo = Boolean(credentials.isDemo);
         const allowed = aiSettings.allowedMarkets || {};
+        const selectedAsset = String(
+          aiSettings.selectedWalletAsset || 'ALL'
+        ).toUpperCase();
+        const allocRatio =
+          Math.min(
+            100,
+            Math.max(1, parseFloat(aiSettings.walletAllocationPct || '100'))
+          ) / 100;
+        const isSelectedAssetQuote = [
+          'USDC',
+          'USDG',
+          'USDT',
+          'EUR',
+          'USD',
+        ].includes(selectedAsset);
 
         // Determine which quote currencies are available in user's wallet & region
         const availUsdc = parseFloat(
           accountBalance?.details?.find((d) => d.ccy === 'USDC')?.availBal ||
+            '0'
+        );
+        const availUsdg = parseFloat(
+          accountBalance?.details?.find((d) => d.ccy === 'USDG')?.availBal ||
             '0'
         );
         const availUsdt = parseFloat(
@@ -1551,7 +2198,10 @@ export default function AutoTradingPanels({
         );
 
         const preferUsdcOnly =
-          region === 'eea' || (availUsdc >= 1 && availUsdt < 1);
+          region === 'eea' ||
+          selectedAsset === 'USDC' ||
+          selectedAsset === 'USDG' ||
+          ((availUsdc >= 1 || availUsdg >= 1) && availUsdt < 1);
 
         // Fetch live catalogs for Spot and Swap (uses regional WebSocket on EEA/Demo!)
         const needSpot =
@@ -1578,7 +2228,7 @@ export default function AutoTradingPanels({
           if (inst?.instId) instByIdMap[inst.instId] = inst;
         }
 
-        const tickersMap = {};
+        const tickersMap = { ...allTickersMap };
         for (const t of [...spotTick, ...swapTick]) {
           tickersMap[t.instId] = t;
         }
@@ -1595,18 +2245,32 @@ export default function AutoTradingPanels({
             const quote =
               inst.quoteCcy || inst.settleCcy || inst.instId.split('-')[1];
             const allowedQuotes =
-              availEur >= 2 && availUsdc < 1
-                ? ['EUR', 'USDC', 'USDT']
-                : ['USDC', 'USDT'];
+              availEur >= 2 && availUsdc < 1 && availUsdg < 1
+                ? ['EUR', 'USDC', 'USDG', 'USDT']
+                : ['USDC', 'USDG', 'USDT', 'EUR'];
             if (!allowedQuotes.includes(quote)) return false;
 
-            // On EEA accounts (MiCA) or when user holds USDC only, prioritize USDC (or EUR) pairs
+            if (selectedAsset === 'EUR' && quote !== 'EUR' && quote !== 'USDC') {
+              return false;
+            }
+
+            // On EEA accounts (MiCA) or when user holds/selects USDC/USDG only, prioritize USDC/USDG pairs
             if (
               preferUsdcOnly &&
               aiSettings.executeRealOrders &&
               hasCredentials &&
               quote === 'USDT' &&
               inst.instType === 'SPOT'
+            ) {
+              return false;
+            }
+
+            const base = inst.baseCcy || inst.instId.split('-')[0];
+            if (
+              selectedAsset !== 'ALL' &&
+              !isSelectedAssetQuote &&
+              !aiSettings.allowAssetRotation &&
+              base !== selectedAsset
             ) {
               return false;
             }
@@ -1637,6 +2301,15 @@ export default function AutoTradingPanels({
           ) {
             continue;
           }
+          // Boost score if user specifically selected this asset from Portfel Handlowy
+          if (
+            selectedAsset !== 'ALL' &&
+            !isSelectedAssetQuote &&
+            scored.baseCcy === selectedAsset
+          ) {
+            scored.score = Math.min(99, scored.score + 20);
+            scored.signalType = `Wybrane z Portfela (${selectedAsset}) • ${scored.signalType}`;
+          }
           scoredList.push(scored);
         }
 
@@ -1662,18 +2335,33 @@ export default function AutoTradingPanels({
           return tk?.last ? { ...h, currentPrice: parseFloat(tk.last) } : h;
         });
 
-        // Also sync non-stablecoin Spot assets from wallet into currentHoldings (up to 2 wallet slots)
-        // so the AI Agent can monitor them for Take Profit & Asset Rotation AND show them in the UI!
+        // Sync non-stablecoin Spot assets from Portfel Handlowy into currentHoldings
+        // Prioritize user's selectedWalletAsset first!
         if (accountBalance?.details?.length) {
+          const orderedWalletDetails = [...accountBalance.details].sort(
+            (a, b) => {
+              const aSel = a.ccy === selectedAsset ? 1 : 0;
+              const bSel = b.ccy === selectedAsset ? 1 : 0;
+              return bSel - aSel;
+            }
+          );
+
           let walletAddedCount = currentHoldings.filter(
             (h) => h.fromWallet
           ).length;
-          for (const balItem of accountBalance.details) {
-            if (walletAddedCount >= 2) break;
+
+          for (const balItem of orderedWalletDetails) {
             const ccy = balItem.ccy;
+            const isSpecificallySelected =
+              selectedAsset !== 'ALL' &&
+              !isSelectedAssetQuote &&
+              ccy === selectedAsset;
+
+            if (!isSpecificallySelected && walletAddedCount >= 2) continue;
             if (
               ccy === 'USDT' ||
               ccy === 'USDC' ||
+              ccy === 'USDG' ||
               ccy === 'USD' ||
               ccy === 'EUR'
             ) {
@@ -1681,7 +2369,7 @@ export default function AutoTradingPanels({
             }
             const avail = parseFloat(balItem.availBal || '0');
             const eqUsd = parseFloat(balItem.eqUsd || '0');
-            if (avail > 0 && eqUsd >= 2) {
+            if (avail > 0 && (eqUsd >= 1 || isSpecificallySelected)) {
               const alreadyTracked = currentHoldings.some(
                 (h) => h.baseCcy === ccy
               );
@@ -1696,22 +2384,27 @@ export default function AutoTradingPanels({
                 if (matchedPair) {
                   const curPx = parseFloat(tickersMap[matchedPair].last);
                   const instMeta = instByIdMap[matchedPair];
-                  currentHoldings.push({
-                    instId: matchedPair,
-                    instIdCode: instMeta?.instIdCode
-                      ? Number(instMeta.instIdCode)
-                      : undefined,
-                    instType: 'SPOT',
-                    baseCcy: ccy,
-                    qty: avail,
-                    entryPrice: curPx,
-                    currentPrice: curPx,
-                    entryScore: 52,
-                    openedAt: new Date().toLocaleTimeString(),
-                    fromWallet: true,
-                    executedVia: 'Portfel Spot OKX',
-                  });
-                  walletAddedCount++;
+                  const qtyTaken = isSpecificallySelected
+                    ? Number((avail * allocRatio).toFixed(6))
+                    : avail;
+                  if (qtyTaken > 0) {
+                    currentHoldings.push({
+                      instId: matchedPair,
+                      instIdCode: instMeta?.instIdCode
+                        ? Number(instMeta.instIdCode)
+                        : undefined,
+                      instType: 'SPOT',
+                      baseCcy: ccy,
+                      qty: qtyTaken,
+                      entryPrice: curPx,
+                      currentPrice: curPx,
+                      entryScore: isSpecificallySelected ? 78 : 52,
+                      openedAt: new Date().toLocaleTimeString(),
+                      fromWallet: true,
+                      executedVia: 'Portfel Spot OKX',
+                    });
+                    walletAddedCount++;
+                  }
                 }
               }
             }
@@ -1743,7 +2436,9 @@ export default function AutoTradingPanels({
                 shouldSendApi: aiSettings.executeRealOrders,
               });
 
-              const profitUsd = (curPx - hold.entryPrice) * hold.qty;
+              const holdQty = Number(hold.qty || 0);
+              const holdEntPx = Number(hold.entryPrice || curPx);
+              const profitUsd = (curPx - holdEntPx) * holdQty;
               const updatedHoldings = currentHoldings.filter(
                 (h) => h.instId !== hold.instId
               );
@@ -1771,15 +2466,21 @@ export default function AutoTradingPanels({
                 actionType: 'AI_PROFIT_HARVEST',
                 instId: hold.instId,
                 side: 'SELL (PROFIT)',
-                amountStr: `${Number(hold.qty).toFixed(4)} ${hold.baseCcy}`,
+                rawBaseCcy: hold.baseCcy || hold.instId.split('-')[0],
+                rawQty: holdQty,
+                rawPrice: curPx,
+                rawQuoteVal: holdQty * curPx,
+                rawEntryPrice: holdEntPx,
+                rawCostVal: holdQty * holdEntPx,
+                amountStr: `${holdQty.toFixed(4)} ${hold.baseCcy}`,
                 priceStr: `${curPx}`,
                 profitUsd,
                 executedVia: execRes.executedVia,
                 reason: `Agent AI zebrał skumulowany profit +${pnlPct.toFixed(
                   2
-                )}% (wejście: ${Number(hold.entryPrice).toFixed(
+                )}% (kupiono po: ${holdEntPx.toFixed(
                   5
-                )} ➔ sprzedaż: ${curPx}). [${execRes.executedVia}]`,
+                )} ➔ sprzedano po: ${curPx}). [${execRes.executedVia}]`,
               });
               return;
             } catch {
@@ -1802,7 +2503,9 @@ export default function AutoTradingPanels({
                 shouldSendApi: aiSettings.executeRealOrders,
               });
 
-              const lossUsd = (curPx - hold.entryPrice) * hold.qty;
+              const holdQty = Number(hold.qty || 0);
+              const holdEntPx = Number(hold.entryPrice || curPx);
+              const lossUsd = (curPx - holdEntPx) * holdQty;
               const updatedHoldings = currentHoldings.filter(
                 (h) => h.instId !== hold.instId
               );
@@ -1829,7 +2532,13 @@ export default function AutoTradingPanels({
                 actionType: 'AI_STOP_LOSS',
                 instId: hold.instId,
                 side: 'SELL (SL)',
-                amountStr: `${Number(hold.qty).toFixed(4)} ${hold.baseCcy}`,
+                rawBaseCcy: hold.baseCcy || hold.instId.split('-')[0],
+                rawQty: holdQty,
+                rawPrice: curPx,
+                rawQuoteVal: holdQty * curPx,
+                rawEntryPrice: holdEntPx,
+                rawCostVal: holdQty * holdEntPx,
+                amountStr: `${holdQty.toFixed(4)} ${hold.baseCcy}`,
                 priceStr: `${curPx}`,
                 profitUsd: lossUsd,
                 executedVia: execRes.executedVia,
@@ -1888,11 +2597,12 @@ export default function AutoTradingPanels({
                 shouldSendApi: aiSettings.executeRealOrders,
               });
 
-              const swapPnlUsd =
-                (weakPx - weakestHold.entryPrice) * weakestHold.qty;
+              const weakQty = Number(weakestHold.qty || 0);
+              const weakEntPx = Number(weakestHold.entryPrice || weakPx);
+              const swapPnlUsd = (weakPx - weakEntPx) * weakQty;
               const proceedsUsdt = Math.max(
                 budgetUsdt,
-                weakestHold.qty * weakPx * 0.995
+                weakQty * weakPx * 0.995
               );
 
               // 2. Immediately buy the stronger opportunity asset
@@ -1953,7 +2663,23 @@ export default function AutoTradingPanels({
                 actionType: 'AI_ASSET_SWAP',
                 instId: `${weakestHold.baseCcy} ➔ ${bestCandidate.baseCcy} (${bestCandidate.instId})`,
                 side: 'SWAP',
-                amountStr: `${Number(weakestHold.qty).toFixed(4)} ${
+                swapSell: {
+                  baseCcy: weakestHold.baseCcy,
+                  instId: weakestHold.instId,
+                  qty: weakQty,
+                  sellPrice: weakPx,
+                  sellValUsd: weakQty * weakPx,
+                  buyPrice: weakEntPx,
+                  buyValUsd: weakQty * weakEntPx,
+                },
+                swapBuy: {
+                  baseCcy: bestCandidate.baseCcy,
+                  instId: bestCandidate.instId,
+                  qty: buyRes.baseQty,
+                  buyPrice: bestCandidate.lastPrice,
+                  buyValUsd: buyRes.quoteVal,
+                },
+                amountStr: `${weakQty.toFixed(4)} ${
                   weakestHold.baseCcy
                 } ➔ ${buyRes.baseQty.toFixed(4)} ${bestCandidate.baseCcy}`,
                 priceStr: `${weakPx} ➔ ${bestCandidate.lastPrice}`,
@@ -2035,6 +2761,10 @@ export default function AutoTradingPanels({
                 actionType: 'AI_BUY_OPPORTUNITY',
                 instId: candidate.instId,
                 side: 'BUY',
+                rawBaseCcy: candidate.baseCcy,
+                rawQty: buyRes.baseQty,
+                rawPrice: candidate.lastPrice,
+                rawQuoteVal: buyRes.quoteVal,
                 amountStr: `${buyRes.baseQty.toFixed(4)} ${
                   candidate.baseCcy
                 } ($${buyRes.quoteVal.toFixed(2)})`,
@@ -2104,6 +2834,10 @@ export default function AutoTradingPanels({
               actionType: 'AI_BUY_OPPORTUNITY',
               instId: fallbackCand.instId,
               side: 'BUY',
+              rawBaseCcy: fallbackCand.baseCcy,
+              rawQty: simRes.baseQty,
+              rawPrice: fallbackCand.lastPrice,
+              rawQuoteVal: simRes.quoteVal,
               amountStr: `${simRes.baseQty.toFixed(4)} ${
                 fallbackCand.baseCcy
               } ($${simRes.quoteVal.toFixed(2)})`,
@@ -2147,6 +2881,7 @@ export default function AutoTradingPanels({
       hasCredentials,
       aiSettings,
       accountBalance,
+      allTickersMap,
       scoreInstrumentOpportunity,
       executeBotOrAiOrder,
       appendHistory,
@@ -2225,6 +2960,239 @@ export default function AutoTradingPanels({
     }
   };
 
+  // Take a chosen asset from Portfel Handlowy into active AI trading
+  const handleTakeWalletAssetToAi = useCallback(
+    async (overrideCcy) => {
+      const targetCcy = String(
+        overrideCcy || aiSettings.selectedWalletAsset || 'ALL'
+      ).toUpperCase();
+
+      if (targetCcy === 'ALL') {
+        runAiAgentCycle(true);
+        return;
+      }
+
+      updateAiSettingsAndSync((prev) => ({
+        ...prev,
+        selectedWalletAsset: targetCcy,
+      }));
+
+      const isStableQuote = ['USDC', 'USDG', 'USDT', 'EUR', 'USD'].includes(
+        targetCcy
+      );
+      if (isStableQuote) {
+        runAiAgentCycle(true);
+        return;
+      }
+
+      const pairId =
+        allTickersMap?.[`${targetCcy}-USDC`]
+          ? `${targetCcy}-USDC`
+          : allTickersMap?.[`${targetCcy}-USDT`]
+          ? `${targetCcy}-USDT`
+          : `${targetCcy}-USDC`;
+
+      let livePx = parseFloat(
+        allTickersMap?.[pairId]?.last ||
+          (instId === pairId && ticker?.last ? ticker.last : '0')
+      );
+      if (!livePx || livePx <= 0) {
+        try {
+          const tk = await fetchTicker(pairId, credentials.region || 'global');
+          if (tk?.last) livePx = parseFloat(tk.last);
+        } catch {
+          // ignore
+        }
+      }
+
+      const walDetail = accountBalance?.details?.find(
+        (d) => d.ccy?.toUpperCase() === targetCcy
+      );
+      const walletAvail = walDetail ? parseFloat(walDetail.availBal || '0') : 0;
+      if ((!livePx || livePx <= 0) && walDetail && walletAvail > 0) {
+        const eqU = parseFloat(walDetail.eqUsd || '0');
+        if (eqU > 0) livePx = eqU / walletAvail;
+      }
+      if (!livePx || livePx <= 0) livePx = 1;
+
+      const existingHold = aiTrackedHoldings.find(
+        (h) => (h.baseCcy || h.instId?.split('-')[0]) === targetCcy
+      );
+      const alreadyActiveQty = existingHold ? Number(existingHold.qty || 0) : 0;
+      const remainingAvail = Math.max(0, walletAvail - alreadyActiveQty);
+      const allocPct =
+        Math.min(
+          100,
+          Math.max(1, parseFloat(aiSettings.walletAllocationPct || '100'))
+        ) / 100;
+
+      if (remainingAvail > 0) {
+        const qtyToTake = Number((remainingAvail * allocPct).toFixed(6));
+        if (qtyToTake <= 0) return;
+
+        let nextHoldings;
+        if (existingHold) {
+          const newQty = alreadyActiveQty + qtyToTake;
+          const newAvgPx =
+            (alreadyActiveQty * Number(existingHold.entryPrice || livePx) +
+              qtyToTake * livePx) /
+            newQty;
+          nextHoldings = aiTrackedHoldings.map((h) =>
+            h.instId === existingHold.instId
+              ? {
+                  ...h,
+                  qty: newQty,
+                  entryPrice: newAvgPx,
+                  currentPrice: livePx,
+                }
+              : h
+          );
+        } else {
+          nextHoldings = [
+            ...aiTrackedHoldings,
+            {
+              instId: pairId,
+              instType: 'SPOT',
+              baseCcy: targetCcy,
+              qty: qtyToTake,
+              entryPrice: livePx,
+              currentPrice: livePx,
+              entryScore: 84,
+              openedAt: new Date().toLocaleTimeString(),
+              fromWallet: true,
+              executedVia: 'Wzięte z Portfela Handlowego',
+            },
+          ];
+        }
+
+        setAiTrackedHoldings(nextHoldings);
+        const valUsd = qtyToTake * livePx;
+
+        setAiLiveStatus((prev) => ({
+          ...prev,
+          currentThought: `💼 Wzięto z Portfela Handlowego do handlu AI: ${qtyToTake.toFixed(
+            4
+          )} ${targetCcy} (wartość wejścia: $${valUsd.toFixed(
+            2
+          )} po cenie ${livePx}). Aktywo monitorowane pod kątem Take Profit i rotacji!`,
+          totalTradesCount: (prev.totalTradesCount || 0) + 1,
+        }));
+
+        appendHistory({
+          ordId: `WAL-${Date.now().toString().slice(-6)}`,
+          source: '💼 Portfel ➔ Agent AI',
+          actionType: 'AI_TAKE_FROM_WALLET',
+          instId: pairId,
+          side: 'BUY (Z PORTFELA)',
+          rawBaseCcy: targetCcy,
+          rawQty: qtyToTake,
+          rawPrice: livePx,
+          rawQuoteVal: valUsd,
+          amountStr: `${qtyToTake.toFixed(4)} ${targetCcy} ($${valUsd.toFixed(
+            2
+          )})`,
+          priceStr: `${livePx}`,
+          profitUsd: null,
+          executedVia: 'Portfel Handlowy OKX',
+          reason: `Pobrano wybrane aktywo ${targetCcy} (${(
+            allocPct * 100
+          ).toFixed(
+            0
+          )}% dostępnego salda) z Portfela Handlowego pod aktywny handel Autonomicznego Agenta AI.`,
+        });
+        publishCrossDeviceState({ aiTrackedHoldings: nextHoldings });
+      } else {
+        // If wallet doesn't hold free units of targetCcy, buy it using tradeBudgetUsdt
+        try {
+          const budget = parseFloat(aiSettings.tradeBudgetUsdt || '20');
+          const buyRes = await executeBotOrAiOrder({
+            source: 'AI_AGENT',
+            targetInstId: pairId,
+            targetInstType: 'SPOT',
+            side: 'buy',
+            amountMode: 'quote',
+            amountValue: budget,
+            currentPrice: livePx,
+            shouldSendApi: aiSettings.executeRealOrders,
+          });
+
+          const nextHoldings = existingHold
+            ? aiTrackedHoldings.map((h) =>
+                h.instId === existingHold.instId
+                  ? {
+                      ...h,
+                      qty: Number(h.qty || 0) + buyRes.baseQty,
+                      currentPrice: livePx,
+                    }
+                  : h
+              )
+            : [
+                ...aiTrackedHoldings,
+                {
+                  instId: pairId,
+                  instType: 'SPOT',
+                  baseCcy: targetCcy,
+                  qty: buyRes.baseQty,
+                  entryPrice: livePx,
+                  currentPrice: livePx,
+                  entryScore: 82,
+                  openedAt: new Date().toLocaleTimeString(),
+                  fromWallet: false,
+                  executedVia: buyRes.executedVia,
+                },
+              ];
+
+          setAiTrackedHoldings(nextHoldings);
+          setAiLiveStatus((prev) => ({
+            ...prev,
+            currentThought: `🤖 Agent AI kupił wybrane aktywo ${pairId}: ${buyRes.baseQty.toFixed(
+              4
+            )} ${targetCcy} za $${buyRes.quoteVal.toFixed(2)} po cenie ${livePx}.`,
+            totalTradesCount: (prev.totalTradesCount || 0) + 1,
+          }));
+
+          appendHistory({
+            ordId: buyRes.ordId,
+            source: '🤖 Agent AI (Wybrane Aktywo)',
+            actionType: 'AI_BUY_OPPORTUNITY',
+            instId: pairId,
+            side: 'BUY',
+            rawBaseCcy: targetCcy,
+            rawQty: buyRes.baseQty,
+            rawPrice: livePx,
+            rawQuoteVal: buyRes.quoteVal,
+            amountStr: `${buyRes.baseQty.toFixed(
+              4
+            )} ${targetCcy} ($${buyRes.quoteVal.toFixed(2)})`,
+            priceStr: `${livePx}`,
+            profitUsd: null,
+            executedVia: buyRes.executedVia,
+            reason: `Zakup wybranego aktywa ${targetCcy} (${pairId}) do handlu AI. [${buyRes.executedVia}]`,
+          });
+          publishCrossDeviceState({ aiTrackedHoldings: nextHoldings });
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [
+      aiSettings.selectedWalletAsset,
+      aiSettings.walletAllocationPct,
+      aiSettings.tradeBudgetUsdt,
+      aiSettings.executeRealOrders,
+      allTickersMap,
+      instId,
+      ticker,
+      credentials.region,
+      accountBalance?.details,
+      aiTrackedHoldings,
+      runAiAgentCycle,
+      executeBotOrAiOrder,
+      appendHistory,
+      publishCrossDeviceState,
+    ]
+  );
+
   const activePairForBot = (
     autoSettings.targetInstId ||
     instId ||
@@ -2232,6 +3200,713 @@ export default function AutoTradingPanels({
   ).trim();
   const activeBaseCcy = activePairForBot.split('-')[0] || 'ONDO';
   const activeQuoteCcy = activePairForBot.split('-')[1] || 'USDC';
+
+  // Manual Emergency Close Single Position (AI Agent or Auto-Bot)
+  const handleEmergencyCloseSinglePosition = useCallback(
+    async (targetInstId) => {
+      if (!targetInstId) return;
+      setClosingPositionId(targetInstId);
+      try {
+        // Check if this is an AI-tracked position
+        const hold = aiTrackedHoldings.find((h) => h.instId === targetInstId);
+        if (hold) {
+          let closePx = Number(hold.currentPrice || hold.entryPrice || 0);
+          try {
+            const liveTk = await fetchTicker(
+              hold.instId,
+              credentials.region || 'global'
+            );
+            if (liveTk?.last && parseFloat(liveTk.last) > 0) {
+              closePx = parseFloat(liveTk.last);
+            }
+          } catch {
+            // keep cached price
+          }
+
+          let sellRes = {
+            ordId: `EMG-${Date.now().toString().slice(-6)}`,
+            executedVia: 'Ręczne Zamknięcie AI (Emergency)',
+          };
+          try {
+            sellRes = await executeBotOrAiOrder({
+              source: 'AI_AGENT',
+              targetInstId: hold.instId,
+              targetInstCode: hold.instIdCode,
+              targetInstType: hold.instType || 'SPOT',
+              side: 'sell',
+              amountMode: 'base',
+              amountValue: hold.qty,
+              currentPrice: closePx,
+              shouldSendApi: aiSettings.executeRealOrders,
+            });
+          } catch {
+            // Even if exchange API rejects (e.g. virtual position), force-close locally
+          }
+
+          const holdQty = Number(hold.qty || 0);
+          const entPx = Number(hold.entryPrice || closePx);
+          const pnlUsd = (closePx - entPx) * holdQty;
+          const pnlPct = entPx > 0 ? ((closePx - entPx) / entPx) * 100 : 0;
+          const holdBase = hold.baseCcy || hold.instId.split('-')[0];
+
+          const remaining = aiTrackedHoldings.filter(
+            (x) => x.instId !== targetInstId
+          );
+          setAiTrackedHoldings(remaining);
+
+          setAiLiveStatus((prev) => ({
+            ...prev,
+            cumulativeProfitUsd: (prev.cumulativeProfitUsd || 0) + pnlUsd,
+            totalTradesCount: (prev.totalTradesCount || 0) + 1,
+            currentThought: `🚨 RĘCZNA INTERWENCJA (EMERGENCY): Zamknięto pozycję ${
+              hold.instId
+            } po cenie ${closePx} (Wynik: ${
+              pnlUsd >= 0 ? '+' : ''
+            }$${pnlUsd.toFixed(2)} / ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(
+              2
+            )}%).`,
+          }));
+
+          appendHistory({
+            ordId: sellRes.ordId,
+            source: '🚨 Emergency (Ręczne AI)',
+            actionType: 'EMERGENCY_CLOSE_SINGLE',
+            instId: hold.instId,
+            side: 'SELL (EMERGENCY)',
+            rawBaseCcy: holdBase,
+            rawQty: holdQty,
+            rawPrice: closePx,
+            rawQuoteVal: holdQty * closePx,
+            rawEntryPrice: entPx,
+            rawCostVal: holdQty * entPx,
+            amountStr: `${holdQty.toFixed(4)} ${holdBase}`,
+            priceStr: `${closePx}`,
+            profitUsd: pnlUsd,
+            executedVia: sellRes.executedVia,
+            reason: `Ręczne awaryjne zamknięcie pojedynczej pozycji AI (${
+              hold.instId
+            }) przez użytkownika po cenie ${closePx} (wejście: ${entPx}, PnL: ${
+              pnlPct >= 0 ? '+' : ''
+            }${pnlPct.toFixed(2)}%).`,
+          });
+
+          publishCrossDeviceState({ aiTrackedHoldings: remaining });
+          return;
+        }
+
+        // Check if this is the Auto-Bot active cycle position
+        if (
+          targetInstId === activePairForBot &&
+          autoBotCycleState.openCyclesCount > 0 &&
+          autoBotCycleState.heldBaseQty > 0
+        ) {
+          const closePx =
+            autoBotCycleState.referencePrice ||
+            autoBotCycleState.avgEntryPrice ||
+            1;
+          const qty = autoBotCycleState.heldBaseQty;
+          const entPx = autoBotCycleState.avgEntryPrice || closePx;
+          const pnlUsd = (closePx - entPx) * qty;
+
+          try {
+            await executeBotOrAiOrder({
+              source: 'AUTOBOT',
+              targetInstId: activePairForBot,
+              targetInstType: activePairForBot.endsWith('-SWAP')
+                ? 'SWAP'
+                : 'SPOT',
+              side: 'sell',
+              amountMode: 'base',
+              amountValue: qty,
+              currentPrice: closePx,
+              shouldSendApi: autoSettings.executeRealOrders,
+            });
+          } catch {
+            // force reset cycle
+          }
+
+          const resetCycle = {
+            ...autoBotCycleState,
+            avgEntryPrice: null,
+            heldBaseQty: 0,
+            openCyclesCount: 0,
+            lastCheckTime: new Date().toLocaleTimeString(),
+            lastStatusMsg: `🚨 Ręcznie zamknięto pozycję Auto-Bota (${activePairForBot}).`,
+            realizedProfitUsd:
+              (autoBotCycleState.realizedProfitUsd || 0) + pnlUsd,
+          };
+          setAutoBotCycleState(resetCycle);
+          appendHistory({
+            source: '🚨 Emergency (Auto-Bot)',
+            actionType: 'EMERGENCY_CLOSE_BOT',
+            instId: activePairForBot,
+            side: 'SELL (EMERGENCY)',
+            rawBaseCcy: activeBaseCcy,
+            rawQty: qty,
+            rawPrice: closePx,
+            rawQuoteVal: qty * closePx,
+            rawEntryPrice: entPx,
+            rawCostVal: qty * entPx,
+            amountStr: `${qty.toFixed(4)} ${activeBaseCcy}`,
+            priceStr: `${closePx}`,
+            profitUsd: pnlUsd,
+            executedVia: 'Emergency Close',
+            reason: `Ręczne zamknięcie pozycji Auto-Bota na parze ${activePairForBot}.`,
+          });
+          publishCrossDeviceState({ autoBotCycleState: resetCycle });
+        }
+      } finally {
+        setClosingPositionId(null);
+      }
+    },
+    [
+      aiTrackedHoldings,
+      credentials.region,
+      executeBotOrAiOrder,
+      aiSettings.executeRealOrders,
+      appendHistory,
+      publishCrossDeviceState,
+      activePairForBot,
+      autoBotCycleState,
+      autoSettings.executeRealOrders,
+      activeBaseCcy,
+    ]
+  );
+
+  // Manual Emergency Close ALL Positions at once (with optional AI Agent deactivation)
+  const handleEmergencyCloseAllPositions = useCallback(
+    async (alsoStopAgent = false) => {
+      if (isClosingAllPositions) return;
+      setIsClosingAllPositions(true);
+      try {
+        if (alsoStopAgent && aiAgentEnabled) {
+          if (onUserToggleAiAgent) {
+            onUserToggleAiAgent(false);
+          } else {
+            setAiAgentEnabled(false);
+          }
+        }
+
+        const holdingsToClose = [...aiTrackedHoldings];
+        let totalEmergencyPnl = 0;
+        let closedCount = 0;
+
+        for (const hold of holdingsToClose) {
+          let closePx = Number(hold.currentPrice || hold.entryPrice || 0);
+          try {
+            const liveTk = await fetchTicker(
+              hold.instId,
+              credentials.region || 'global'
+            );
+            if (liveTk?.last && parseFloat(liveTk.last) > 0) {
+              closePx = parseFloat(liveTk.last);
+            }
+          } catch {
+            // keep cached price
+          }
+
+          let sellRes = {
+            ordId: `EMG-ALL-${Date.now().toString().slice(-5)}-${closedCount}`,
+            executedVia: 'Emergency Close All',
+          };
+          try {
+            sellRes = await executeBotOrAiOrder({
+              source: 'AI_AGENT',
+              targetInstId: hold.instId,
+              targetInstCode: hold.instIdCode,
+              targetInstType: hold.instType || 'SPOT',
+              side: 'sell',
+              amountMode: 'base',
+              amountValue: hold.qty,
+              currentPrice: closePx,
+              shouldSendApi: aiSettings.executeRealOrders,
+            });
+          } catch {
+            // continue closing remaining positions even if one API order fails
+          }
+
+          const holdQty = Number(hold.qty || 0);
+          const entPx = Number(hold.entryPrice || closePx);
+          const pnlUsd = (closePx - entPx) * holdQty;
+          const holdBase = hold.baseCcy || hold.instId.split('-')[0];
+          totalEmergencyPnl += pnlUsd;
+          closedCount += 1;
+
+          appendHistory({
+            ordId: sellRes.ordId,
+            source: '🚨 EMERGENCY STOP ALL',
+            actionType: 'EMERGENCY_CLOSE_ALL',
+            instId: hold.instId,
+            side: 'SELL ALL (EMERGENCY)',
+            rawBaseCcy: holdBase,
+            rawQty: holdQty,
+            rawPrice: closePx,
+            rawQuoteVal: holdQty * closePx,
+            rawEntryPrice: entPx,
+            rawCostVal: holdQty * entPx,
+            amountStr: `${holdQty.toFixed(4)} ${holdBase}`,
+            priceStr: `${closePx}`,
+            profitUsd: pnlUsd,
+            executedVia: sellRes.executedVia,
+            reason: `Awaryjne zamknięcie wszystkich pozycji AI naraz (${closedCount}/${holdingsToClose.length}): sprzedano ${hold.instId} po ${closePx}.`,
+          });
+        }
+
+        setAiTrackedHoldings([]);
+        setAiLiveStatus((prev) => ({
+          ...prev,
+          isScanning: false,
+          cumulativeProfitUsd:
+            (prev.cumulativeProfitUsd || 0) + totalEmergencyPnl,
+          totalTradesCount: (prev.totalTradesCount || 0) + closedCount,
+          currentThought: `🚨 EMERGENCY: Ręcznie zamknięto wszystkie pozycje AI (${closedCount} poz.). Łączny wynik operacji: ${
+            totalEmergencyPnl >= 0 ? '+' : ''
+          }$${totalEmergencyPnl.toFixed(2)}.${
+            alsoStopAgent ? ' Agent AI został zatrzymany.' : ''
+          }`,
+        }));
+
+        publishCrossDeviceState({
+          aiTrackedHoldings: [],
+          ...(alsoStopAgent ? { aiAgentEnabled: false } : {}),
+        });
+      } finally {
+        setIsClosingAllPositions(false);
+      }
+    },
+    [
+      isClosingAllPositions,
+      aiAgentEnabled,
+      onUserToggleAiAgent,
+      setAiAgentEnabled,
+      aiTrackedHoldings,
+      credentials.region,
+      executeBotOrAiOrder,
+      aiSettings.executeRealOrders,
+      appendHistory,
+      publishCrossDeviceState,
+    ]
+  );
+
+  emergencyHandlersRef.current = {
+    closeSingle: handleEmergencyCloseSinglePosition,
+    closeAll: handleEmergencyCloseAllPositions,
+    selectWalletAsset: (ccy) => {
+      updateAiSettingsAndSync((prev) => ({
+        ...prev,
+        selectedWalletAsset: ccy || 'ALL',
+      }));
+      setActiveSubTab('ai_agent');
+    },
+    takeWalletAsset: handleTakeWalletAssetToAi,
+    setValuationCcy: (ccy) => {
+      updateAiSettingsAndSync((prev) => ({
+        ...prev,
+        summaryValuationCcy: ccy === 'USDG' ? 'USDG' : 'USDC',
+      }));
+    },
+  };
+
+  const valCcy = assetLedgerAndSummary.summary.valuationCcy || 'USDC';
+
+  const renderAssetStatusPanel = () => {
+    const { summary, ledgerRows } = assetLedgerAndSummary;
+    const ccy = summary.valuationCcy || 'USDC';
+
+    return (
+      <div className="asset-status-panel-box">
+        <div className="asset-status-panel-header">
+          <div className="asset-status-title-group">
+            <div className="box-title" style={{ marginBottom: 0 }}>
+              <Layers size={16} />
+              <span>
+                Panel Stanu Aktywów (Na żywo: Wzięte do handlu, Kupiono,
+                Sprzedano i Pozostałe do wyboru)
+              </span>
+            </div>
+            <p className="asset-status-subtitle">
+              Bieżące rozliczenie wszystkich aktywów z Portfela Handlowego oraz
+              transakcji Autonomicznego Agenta AI i Auto-Bota w wybranej walucie
+              przeliczeniowej ({ccy}).
+            </p>
+          </div>
+
+          <div className="valuation-ccy-switcher">
+            <span className="valuation-ccy-label">
+              Waluta podsumowania:
+            </span>
+            <div className="unit-switch valuation-unit-switch">
+              <button
+                type="button"
+                className={ccy === 'USDC' ? 'active' : ''}
+                onClick={() =>
+                  updateAiSettingsAndSync((prev) => ({
+                    ...prev,
+                    summaryValuationCcy: 'USDC',
+                  }))
+                }
+              >
+                💵 USDC (Domyślnie)
+              </button>
+              <button
+                type="button"
+                className={ccy === 'USDG' ? 'active' : ''}
+                onClick={() =>
+                  updateAiSettingsAndSync((prev) => ({
+                    ...prev,
+                    summaryValuationCcy: 'USDG',
+                  }))
+                }
+              >
+                🪙 USDG (Global Dollar)
+              </button>
+            </div>
+            <span className="valuation-rate-hint">
+              Kurs: 1 USDG = {summary.usdgRateInUsdc.toFixed(4)} USDC
+            </span>
+          </div>
+        </div>
+
+        {/* 4 Summary Cards in USDC or USDG */}
+        <div className="asset-summary-cards-grid">
+          <div className="asset-summary-card card-taken">
+            <div className="summary-card-top">
+              <span className="summary-card-tag">1. WZIĘTE DO HANDLU (KUPIONO)</span>
+              <span className="summary-ccy-badge">{ccy}</span>
+            </div>
+            <div className="summary-card-main-val">
+              {summary.totalTakenBoughtVal.toFixed(2)} <small>{ccy}</small>
+            </div>
+            <div className="summary-card-subrows">
+              <div>
+                <span>Aktualnie w handlu (zakup):</span>
+                <strong>
+                  {summary.currentInTradeEntryVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+              <div>
+                <span>Wycena rynkowa w handlu (na żywo):</span>
+                <strong className="pos">
+                  {summary.currentInTradeMarketVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="asset-summary-card card-sold">
+            <div className="summary-card-top">
+              <span className="summary-card-tag">2. WSZYSTKO CO SPRZEDANO</span>
+              <span className="summary-ccy-badge">{ccy}</span>
+            </div>
+            <div className="summary-card-main-val">
+              {summary.totalSoldVal.toFixed(2)} <small>{ccy}</small>
+            </div>
+            <div className="summary-card-subrows">
+              <div>
+                <span>Koszt zakupu sprzedanych:</span>
+                <strong>
+                  {summary.totalSoldCostVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+              <div>
+                <span>Zrealizowany zysk ze sprzedaży:</span>
+                <strong className={summary.realizedPnlVal >= 0 ? 'pos' : 'neg'}>
+                  {summary.realizedPnlVal >= 0 ? '+' : ''}
+                  {summary.realizedPnlVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="asset-summary-card card-remaining">
+            <div className="summary-card-top">
+              <span className="summary-card-tag">
+                3. ZOSTAŁO DO WYBORU (PORTFEL)
+              </span>
+              <span className="summary-ccy-badge">{ccy}</span>
+            </div>
+            <div className="summary-card-main-val">
+              {summary.totalRemainingToChooseVal.toFixed(2)}{' '}
+              <small>{ccy}</small>
+            </div>
+            <div className="summary-card-subrows">
+              <div>
+                <span>Całkowita wartość Portfela:</span>
+                <strong>
+                  {summary.totalWalletVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+              <div>
+                <span>Wybrane aktywo dla AI:</span>
+                <strong style={{ color: '#60a5fa' }}>
+                  {aiSettings.selectedWalletAsset === 'ALL'
+                    ? 'Wszystkie (Auto)'
+                    : aiSettings.selectedWalletAsset}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="asset-summary-card card-pnl">
+            <div className="summary-card-top">
+              <span className="summary-card-tag">
+                4. ŁĄCZNY BILANS HANDLU (NA ŻYWO)
+              </span>
+              <span className="summary-ccy-badge">{ccy}</span>
+            </div>
+            <div
+              className={`summary-card-main-val ${
+                summary.totalCombinedPnlVal >= 0 ? 'pos' : 'neg'
+              }`}
+            >
+              {summary.totalCombinedPnlVal >= 0 ? '+' : ''}
+              {summary.totalCombinedPnlVal.toFixed(2)} <small>{ccy}</small>
+            </div>
+            <div className="summary-card-subrows">
+              <div>
+                <span>Niezrealizowany PnL (otwarte):</span>
+                <strong
+                  className={summary.unrealizedPnlVal >= 0 ? 'pos' : 'neg'}
+                >
+                  {summary.unrealizedPnlVal >= 0 ? '+' : ''}
+                  {summary.unrealizedPnlVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+              <div>
+                <span>Zrealizowany PnL (zamknięte):</span>
+                <strong className={summary.realizedPnlVal >= 0 ? 'pos' : 'neg'}>
+                  {summary.realizedPnlVal >= 0 ? '+' : ''}
+                  {summary.realizedPnlVal.toFixed(2)} {ccy}
+                </strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Live Per-Asset Status Table */}
+        <div className="table-responsive" style={{ marginTop: '12px' }}>
+          <table className="orders-table asset-ledger-table">
+            <thead>
+              <tr>
+                <th>Aktywo / Kurs ({ccy})</th>
+                <th>W Portfelu Handlowym</th>
+                <th>Ile wzięto do handlu</th>
+                <th>Za ile kupiono ({ccy})</th>
+                <th>Za ile sprzedano ({ccy})</th>
+                <th>Ile zostało do wyboru ({ccy})</th>
+                <th>Bilans PnL ({ccy})</th>
+                <th>Akcja / Sterowanie</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ledgerRows.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="orders-empty">
+                    Brak aktywów do wyświetlenia.
+                  </td>
+                </tr>
+              ) : (
+                ledgerRows.map((row) => {
+                  const isSelectedForAi =
+                    aiSettings.selectedWalletAsset === row.ccy;
+                  const canTakeToTrade =
+                    !row.isStableQuote &&
+                    (row.remainingToChooseQty > 0 || row.activeQty === 0);
+
+                  return (
+                    <tr
+                      key={row.ccy}
+                      className={
+                        isSelectedForAi
+                          ? 'asset-row-selected'
+                          : row.activeQty > 0
+                          ? 'asset-row-active'
+                          : ''
+                      }
+                    >
+                      <td>
+                        <div className="asset-cell-main">
+                          <strong>{row.ccy}</strong>
+                          {row.activeQty > 0 && (
+                            <span className="badge badge-buy">W HANDLU AI</span>
+                          )}
+                          {isSelectedForAi && (
+                            <span className="badge badge-swap">
+                              WYBRANE W AI
+                            </span>
+                          )}
+                          {row.inWallet && row.activeQty === 0 && (
+                            <span className="mini-type-tag">W PORTFELU</span>
+                          )}
+                        </div>
+                        <small style={{ color: 'var(--text-secondary)' }}>
+                          Cena: {row.livePriceVal.toFixed(row.livePriceVal < 1 ? 5 : 2)}{' '}
+                          {ccy}
+                        </small>
+                      </td>
+
+                      <td>
+                        <div>
+                          <strong>
+                            {row.walletTotalQty.toFixed(4)} {row.ccy}
+                          </strong>
+                        </div>
+                        <small style={{ color: 'var(--text-secondary)' }}>
+                          ≈ {row.walletTotalVal.toFixed(2)} {ccy}
+                        </small>
+                      </td>
+
+                      <td>
+                        <div>
+                          Łącznie wzięto:{' '}
+                          <strong>
+                            {row.takenQty.toFixed(4)} {row.ccy}
+                          </strong>
+                        </div>
+                        <small
+                          style={{
+                            color:
+                              row.activeQty > 0
+                                ? '#60a5fa'
+                                : 'var(--text-secondary)',
+                          }}
+                        >
+                          Aktywnie w grze: {row.activeQty.toFixed(4)} {row.ccy}
+                        </small>
+                      </td>
+
+                      <td>
+                        <div>
+                          Łącznie kupiono za:{' '}
+                          <strong>
+                            {row.totalBoughtVal.toFixed(2)} {ccy}
+                          </strong>
+                        </div>
+                        <small style={{ color: 'var(--text-secondary)' }}>
+                          Śr. cena zakupu:{' '}
+                          {row.avgBuyPrice > 0
+                            ? `${row.avgBuyPrice.toFixed(
+                                row.avgBuyPrice < 1 ? 5 : 2
+                              )} ${ccy}`
+                            : '—'}{' '}
+                          {row.activeEntryVal > 0
+                            ? `(Aktywne: ${row.activeEntryVal.toFixed(2)} ${ccy})`
+                            : ''}
+                        </small>
+                      </td>
+
+                      <td>
+                        <div>
+                          Sprzedano za:{' '}
+                          <strong>
+                            {row.totalSoldVal.toFixed(2)} {ccy}
+                          </strong>
+                        </div>
+                        <small style={{ color: 'var(--text-secondary)' }}>
+                          Ilość: {row.soldQty.toFixed(4)} {row.ccy} | Śr. cena:{' '}
+                          {row.avgSellPrice > 0
+                            ? `${row.avgSellPrice.toFixed(
+                                row.avgSellPrice < 1 ? 5 : 2
+                              )} ${ccy}`
+                            : '—'}
+                        </small>
+                      </td>
+
+                      <td>
+                        <div>
+                          <strong style={{ color: '#38bdf8' }}>
+                            {row.remainingToChooseQty.toFixed(4)} {row.ccy}
+                          </strong>
+                        </div>
+                        <small style={{ color: 'var(--text-secondary)' }}>
+                          Do wyboru: ≈{' '}
+                          <strong>
+                            {row.remainingToChooseVal.toFixed(2)} {ccy}
+                          </strong>
+                        </small>
+                      </td>
+
+                      <td>
+                        <div
+                          className={
+                            row.totalPnl >= 0 ? 'pos' : 'neg'
+                          }
+                        >
+                          <strong>
+                            {row.totalPnl >= 0 ? '+' : ''}
+                            {row.totalPnl.toFixed(2)} {ccy}
+                          </strong>
+                        </div>
+                        <small style={{ color: 'var(--text-secondary)' }}>
+                          Zreal.: {row.realizedPnl >= 0 ? '+' : ''}
+                          {row.realizedPnl.toFixed(2)} | Otw.:{' '}
+                          {row.unrealizedPnl >= 0 ? '+' : ''}
+                          {row.unrealizedPnl.toFixed(2)}
+                        </small>
+                      </td>
+
+                      <td>
+                        <div className="asset-row-actions">
+                          <button
+                            type="button"
+                            className={`secondary-sm-btn ${
+                              isSelectedForAi ? 'active-choice-btn' : ''
+                            }`}
+                            onClick={() =>
+                              updateAiSettingsAndSync((prev) => ({
+                                ...prev,
+                                selectedWalletAsset: isSelectedForAi
+                                  ? 'ALL'
+                                  : row.ccy,
+                              }))
+                            }
+                            title="Wybierz to aktywo w Konfiguracji Autonomicznego Agenta AI"
+                          >
+                            {isSelectedForAi
+                              ? '✓ Wybrane w AI'
+                              : 'Wybierz w AI'}
+                          </button>
+
+                          {canTakeToTrade && (
+                            <button
+                              type="button"
+                              className="take-to-trade-sm-btn"
+                              onClick={() => handleTakeWalletAssetToAi(row.ccy)}
+                              title="Natychmiast weź to aktywo z Portfela Handlowego pod nadzór i handel Agenta AI"
+                            >
+                              ⚡ Weź do handlu
+                            </button>
+                          )}
+
+                          {row.activeQty > 0 && row.activeInstId && (
+                            <button
+                              type="button"
+                              className="emergency-single-close-btn"
+                              onClick={() =>
+                                handleEmergencyCloseSinglePosition(
+                                  row.activeInstId
+                                )
+                              }
+                              disabled={
+                                closingPositionId === row.activeInstId ||
+                                isClosingAllPositions
+                              }
+                            >
+                              Sprzedaj teraz
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <section className="card automation-hub-card">
@@ -2275,16 +3950,37 @@ export default function AutoTradingPanels({
           <button
             type="button"
             className={`auto-subtab ${
+              activeSubTab === 'asset_status' ? 'active' : ''
+            }`}
+            onClick={() => setActiveSubTab('asset_status')}
+          >
+            <Layers size={16} />
+            <span>3. Panel Stanu Aktywów (Portfel ⇄ AI)</span>
+            <span className="mini-status-pill ai-on">{valCcy}</span>
+          </button>
+
+          <button
+            type="button"
+            className={`auto-subtab ${
               activeSubTab === 'history' ? 'active' : ''
             }`}
             onClick={() => setActiveSubTab('history')}
           >
             <History size={16} />
-            <span>3. Historia Działań i Zysków ({actionHistory.length})</span>
+            <span>4. Historia Działań i Zysków ({actionHistory.length})</span>
           </button>
         </div>
 
         <div className="automation-summary-pills">
+          <div className="summary-pill">
+            <span>W handlu / Do wyboru ({valCcy}):</span>
+            <strong style={{ color: '#60a5fa' }}>
+              {assetLedgerAndSummary.summary.currentInTradeMarketVal.toFixed(2)}{' '}
+              / {assetLedgerAndSummary.summary.totalRemainingToChooseVal.toFixed(2)}{' '}
+              {valCcy}
+            </strong>
+          </div>
+
           <button
             type="button"
             className="summary-pill sync-pill-btn"
@@ -2304,8 +4000,9 @@ export default function AutoTradingPanels({
           <div className="summary-pill">
             <span>Skumulowany Profit (Bot + AI):</span>
             <strong className={totalRealizedProfit >= 0 ? 'pos' : 'neg'}>
-              {totalRealizedProfit >= 0 ? '+' : ''}$
-              {totalRealizedProfit.toFixed(2)} USD
+              {totalRealizedProfit >= 0 ? '+' : ''}
+              { (totalRealizedProfit * assetLedgerAndSummary.summary.convFactor).toFixed(2) }{' '}
+              {valCcy}
             </strong>
           </div>
         </div>
@@ -2705,6 +4402,33 @@ export default function AutoTradingPanels({
             </div>
 
             <div className="status-banner-actions">
+              {aiTrackedHoldings.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    className="emergency-close-all-btn"
+                    onClick={() => handleEmergencyCloseAllPositions(false)}
+                    disabled={isClosingAllPositions}
+                    title="Awaryjnie sprzedaj i zamknij wszystkie otwarte pozycje Agenta AI naraz"
+                  >
+                    <AlertCircle size={14} />
+                    {isClosingAllPositions
+                      ? 'Zamykanie pozycji...'
+                      : `🚨 Emergency: Zamknij Wszystkie (${aiTrackedHoldings.length})`}
+                  </button>
+                  <button
+                    type="button"
+                    className="emergency-stop-all-btn"
+                    onClick={() => handleEmergencyCloseAllPositions(true)}
+                    disabled={isClosingAllPositions}
+                    title="Natychmiast wyłącz Agenta AI i zamknij wszystkie jego pozycje"
+                  >
+                    <Square size={14} />
+                    🛑 Stop AI + Zamknij Wszystko
+                  </button>
+                </>
+              )}
+
               <button
                 type="button"
                 className="secondary-sm-btn"
@@ -2762,6 +4486,243 @@ export default function AutoTradingPanels({
                   . Wszystkie otwarte pozycje i zlecenia AI są widoczne również w
                   dolnym panelu aplikacji.
                 </div>
+              </div>
+
+              {/* Wallet Asset Selection for AI Agent */}
+              <div className="ai-wallet-asset-selector-box">
+                <div className="ai-wallet-selector-header">
+                  <div className="box-title" style={{ marginBottom: 0 }}>
+                    <Wallet size={15} />
+                    <span>
+                      Wybór Aktywa z Portfela Handlowego dla Agenta AI
+                    </span>
+                  </div>
+                  <div className="unit-switch mini-ccy-switch">
+                    <button
+                      type="button"
+                      className={valCcy === 'USDC' ? 'active' : ''}
+                      onClick={() =>
+                        updateAiSettingsAndSync((prev) => ({
+                          ...prev,
+                          summaryValuationCcy: 'USDC',
+                        }))
+                      }
+                    >
+                      USDC
+                    </button>
+                    <button
+                      type="button"
+                      className={valCcy === 'USDG' ? 'active' : ''}
+                      onClick={() =>
+                        updateAiSettingsAndSync((prev) => ({
+                          ...prev,
+                          summaryValuationCcy: 'USDG',
+                        }))
+                      }
+                    >
+                      USDG
+                    </button>
+                  </div>
+                </div>
+
+                <div className="form-group" style={{ marginTop: '8px' }}>
+                  <label>
+                    Wybierz aktywo znajdujące się w Portfelu Handlowym do
+                    obsługi przez Agenta AI
+                  </label>
+                  <select
+                    className="wallet-asset-select"
+                    value={aiSettings.selectedWalletAsset || 'ALL'}
+                    onChange={(e) =>
+                      updateAiSettingsAndSync((prev) => ({
+                        ...prev,
+                        selectedWalletAsset: e.target.value,
+                      }))
+                    }
+                  >
+                    <option value="ALL">
+                      🔄 Wszystkie aktywa z Portfela Handlowego (Automatyczny
+                      wybór AI)
+                    </option>
+                    {assetLedgerAndSummary.walletChoices.map((w) => (
+                      <option key={w.ccy} value={w.ccy}>
+                        {w.ccy} — W portfelu: {w.walletTotalQty.toFixed(4)}{' '}
+                        {w.ccy} | Wzięto do handlu: {w.takenQty.toFixed(4)} |
+                        Zostało do wyboru: {w.remainingToChooseQty.toFixed(4)}{' '}
+                        (≈ {w.remainingToChooseVal.toFixed(2)} {valCcy})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Quick clickable chips for assets in Portfel Handlowy */}
+                <div className="wallet-asset-pills-row">
+                  <button
+                    type="button"
+                    className={`quote-pill ${
+                      (aiSettings.selectedWalletAsset || 'ALL') === 'ALL'
+                        ? 'active'
+                        : ''
+                    }`}
+                    onClick={() =>
+                      updateAiSettingsAndSync((prev) => ({
+                        ...prev,
+                        selectedWalletAsset: 'ALL',
+                      }))
+                    }
+                  >
+                    {(aiSettings.selectedWalletAsset || 'ALL') === 'ALL'
+                      ? '✓ '
+                      : ''}
+                    Wszystkie (Auto)
+                  </button>
+                  {assetLedgerAndSummary.walletChoices.map((w) => {
+                    const isSel = aiSettings.selectedWalletAsset === w.ccy;
+                    return (
+                      <button
+                        key={w.ccy}
+                        type="button"
+                        className={`quote-pill ${isSel ? 'active' : ''}`}
+                        onClick={() =>
+                          updateAiSettingsAndSync((prev) => ({
+                            ...prev,
+                            selectedWalletAsset: w.ccy,
+                          }))
+                        }
+                        title={`W portfelu: ${w.walletTotalQty.toFixed(
+                          4
+                        )} ${w.ccy} | Wzięto: ${w.takenQty.toFixed(
+                          4
+                        )} | Zostało: ${w.remainingToChooseQty.toFixed(
+                          4
+                        )} (${w.remainingToChooseVal.toFixed(2)} ${valCcy})`}
+                      >
+                        {isSel ? '✓ ' : ''}
+                        <strong>{w.ccy}</strong>
+                        <small style={{ marginLeft: '4px', opacity: 0.85 }}>
+                          ({w.remainingToChooseVal.toFixed(1)} {valCcy})
+                        </small>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Allocation % & Instant Take Action when a specific asset or wallet asset is selected */}
+                <div className="wallet-allocation-controls">
+                  <div className="allocation-pct-group">
+                    <span>Ile % wolnego aktywa brać do handlu:</span>
+                    <div className="pos-mode-pills">
+                      {['25', '50', '75', '100'].map((pct) => (
+                        <button
+                          key={pct}
+                          type="button"
+                          className={
+                            String(aiSettings.walletAllocationPct || '100') ===
+                            pct
+                              ? 'active'
+                              : ''
+                          }
+                          onClick={() =>
+                            updateAiSettingsAndSync((prev) => ({
+                              ...prev,
+                              walletAllocationPct: pct,
+                            }))
+                          }
+                        >
+                          {pct}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {aiSettings.selectedWalletAsset &&
+                    aiSettings.selectedWalletAsset !== 'ALL' && (
+                      <button
+                        type="button"
+                        className="take-to-trade-primary-btn"
+                        onClick={() =>
+                          handleTakeWalletAssetToAi(
+                            aiSettings.selectedWalletAsset
+                          )
+                        }
+                      >
+                        <Zap size={14} />
+                        Weź {aiSettings.selectedWalletAsset} (
+                        {aiSettings.walletAllocationPct || 100}%) do handlu AI
+                        teraz
+                      </button>
+                    )}
+                </div>
+
+                {/* Live Mini Status of the selected asset */}
+                {(() => {
+                  const selCcy = aiSettings.selectedWalletAsset || 'ALL';
+                  if (selCcy === 'ALL') {
+                    return (
+                      <div className="selected-asset-live-strip">
+                        <span>
+                          <strong>Wzięto do handlu:</strong>{' '}
+                          {assetLedgerAndSummary.summary.totalTakenBoughtVal.toFixed(
+                            2
+                          )}{' '}
+                          {valCcy}
+                        </span>
+                        <span>
+                          <strong>Sprzedano za:</strong>{' '}
+                          {assetLedgerAndSummary.summary.totalSoldVal.toFixed(2)}{' '}
+                          {valCcy}
+                        </span>
+                        <span>
+                          <strong>Zostało do wyboru:</strong>{' '}
+                          <strong style={{ color: '#38bdf8' }}>
+                            {assetLedgerAndSummary.summary.totalRemainingToChooseVal.toFixed(
+                              2
+                            )}{' '}
+                            {valCcy}
+                          </strong>
+                        </span>
+                      </div>
+                    );
+                  }
+                  const selRow = assetLedgerAndSummary.ledgerRows.find(
+                    (r) => r.ccy === selCcy
+                  );
+                  if (!selRow) return null;
+                  return (
+                    <div className="selected-asset-live-strip">
+                      <span>
+                        <strong>Aktywo {selRow.ccy}:</strong> Wzięto do handlu:{' '}
+                        <strong>
+                          {selRow.takenQty.toFixed(4)} {selRow.ccy}
+                        </strong>{' '}
+                        (Aktywnie: {selRow.activeQty.toFixed(4)})
+                      </span>
+                      <span>
+                        <strong>Kupiono za:</strong>{' '}
+                        {selRow.totalBoughtVal.toFixed(2)} {valCcy} (śr.{' '}
+                        {selRow.avgBuyPrice > 0
+                          ? selRow.avgBuyPrice.toFixed(4)
+                          : '—'}
+                        )
+                      </span>
+                      <span>
+                        <strong>Sprzedano za:</strong>{' '}
+                        {selRow.totalSoldVal.toFixed(2)} {valCcy} (śr.{' '}
+                        {selRow.avgSellPrice > 0
+                          ? selRow.avgSellPrice.toFixed(4)
+                          : '—'}
+                        )
+                      </span>
+                      <span>
+                        <strong>Zostało do wyboru:</strong>{' '}
+                        <strong style={{ color: '#38bdf8' }}>
+                          {selRow.remainingToChooseQty.toFixed(4)} {selRow.ccy}{' '}
+                          (≈ {selRow.remainingToChooseVal.toFixed(2)} {valCcy})
+                        </strong>
+                      </span>
+                    </div>
+                  );
+                })()}
               </div>
 
               <div className="form-group">
@@ -2985,29 +4946,44 @@ export default function AutoTradingPanels({
                 <Sparkles size={15} />
                 <span>
                   Radar Okazji Agenta AI ({aiLiveStatus.scannedCount}{' '}
-                  przeskanowanych rynków) oraz Aktywne Pozycje AI
+                  przeskanowanych rynków) oraz Ręczne Sterowanie Pozycjami
+                  (Emergency)
                 </span>
               </div>
 
-              {/* Active AI Holdings */}
+              {/* Active AI Holdings with Emergency Manual Controls */}
               <div className="tracked-positions-mini">
                 <div className="tracked-header">
                   <strong>
-                    Aktywne aktywa pod nadzorem AI ({aiTrackedHoldings.length} /{' '}
-                    {aiSettings.maxConcurrentHoldings})
+                    Aktywne pozycje pod nadzorem AI ({aiTrackedHoldings.length}{' '}
+                    / {aiSettings.maxConcurrentHoldings})
                   </strong>
-                  {aiTrackedHoldings.length > 0 && (
-                    <button
-                      type="button"
-                      className="text-link-btn"
-                      onClick={() => {
-                        setAiTrackedHoldings([]);
-                        publishCrossDeviceState({ aiTrackedHoldings: [] });
-                      }}
-                    >
-                      Wyczyść listę śledzenia
-                    </button>
-                  )}
+                  <div className="tracked-header-actions">
+                    {aiTrackedHoldings.length > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          className="emergency-close-all-btn"
+                          onClick={() => handleEmergencyCloseAllPositions(false)}
+                          disabled={isClosingAllPositions}
+                          title="Ręcznie zamknij (sprzedaj) wszystkie otwarte pozycje AI naraz"
+                        >
+                          {isClosingAllPositions
+                            ? 'Zamykanie...'
+                            : `🚨 Zamknij Wszystkie (${aiTrackedHoldings.length})`}
+                        </button>
+                        <button
+                          type="button"
+                          className="emergency-stop-all-btn"
+                          onClick={() => handleEmergencyCloseAllPositions(true)}
+                          disabled={isClosingAllPositions}
+                          title="Zatrzymaj Agenta AI i zamknij wszystkie pozycje"
+                        >
+                          🛑 Stop AI + Zamknij Wszystko
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
 
                 {aiTrackedHoldings.length === 0 ? (
@@ -3022,14 +4998,19 @@ export default function AutoTradingPanels({
                     const entPx = Number(h.entryPrice || curPx || 1);
                     const pnlPct =
                       entPx > 0 ? ((curPx - entPx) / entPx) * 100 : 0;
+                    const pnlUsd = (curPx - entPx) * Number(h.qty || 0);
+                    const isClosingThis = closingPositionId === h.instId;
+
                     return (
                       <div key={h.instId} className="tracked-row">
-                        <div>
+                        <div className="tracked-row-info">
                           <strong
                             style={{ cursor: 'pointer', color: '#60a5fa' }}
                             onClick={() =>
-                              onSelectInstrument &&
-                              onSelectInstrument(h.instId, h.instType)
+                              onOpenChart
+                                ? onOpenChart(h.instId, h.instType)
+                                : onSelectInstrument &&
+                                  onSelectInstrument(h.instId, h.instType)
                             }
                           >
                             {h.instId}
@@ -3040,13 +5021,40 @@ export default function AutoTradingPanels({
                             Wejście: {h.entryPrice} • Teraz: {curPx}{' '}
                             <strong className={pnlPct >= 0 ? 'pos' : 'neg'}>
                               ({pnlPct >= 0 ? '+' : ''}
-                              {pnlPct.toFixed(2)}%)
+                              {pnlPct.toFixed(2)}% /{' '}
+                              {pnlUsd >= 0 ? '+' : ''}${pnlUsd.toFixed(2)})
                             </strong>
                           </small>
                         </div>
-                        <span className="rule-badge">
-                          Score: {h.entryScore}/100
-                        </span>
+
+                        <div className="tracked-row-actions">
+                          <span className="rule-badge">
+                            Score: {h.entryScore}/100
+                          </span>
+                          {onOpenChart && (
+                            <button
+                              type="button"
+                              className="secondary-sm-btn"
+                              onClick={() => onOpenChart(h.instId, h.instType)}
+                              title="Otwórz wykres pełnoekranowy dla tego aktywa"
+                            >
+                              📈 Wykres
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="emergency-single-close-btn"
+                            onClick={() =>
+                              handleEmergencyCloseSinglePosition(h.instId)
+                            }
+                            disabled={isClosingThis || isClosingAllPositions}
+                            title="Awaryjnie zamknij (sprzedaj) tę pojedynczą pozycję ręcznie"
+                          >
+                            {isClosingThis
+                              ? 'Zamykanie...'
+                              : '🚨 Zamknij pozycję'}
+                          </button>
+                        </div>
                       </div>
                     );
                   })
@@ -3087,13 +5095,27 @@ export default function AutoTradingPanels({
                             {opp.categoryTag}
                           </span>
                         </div>
-                        <span
-                          className={`ai-score-pill ${
-                            opp.score >= 70 ? 'high' : 'mid'
-                          }`}
-                        >
-                          AI Score: {opp.score}/100
-                        </span>
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                          {onOpenChart && (
+                            <button
+                              type="button"
+                              className="secondary-sm-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenChart(opp.instId, opp.instType);
+                              }}
+                            >
+                              📈 Pokaż wykres
+                            </button>
+                          )}
+                          <span
+                            className={`ai-score-pill ${
+                              opp.score >= 70 ? 'high' : 'mid'
+                            }`}
+                          >
+                            AI Score: {opp.score}/100
+                          </span>
+                        </div>
                       </div>
                       <div className="ai-opp-meta">
                         <span>Cena: {opp.lastPrice}</span>
@@ -3114,7 +5136,17 @@ export default function AutoTradingPanels({
               )}
             </div>
           </div>
+
+          {/* Live Asset Status Panel directly below AI Agent Config & Radar */}
+          {renderAssetStatusPanel()}
         </div>
+      )}
+
+      {/* ====================================================================
+          TAB 2.5: DEDICATED ASSET STATUS PANEL (PORTFEL HANDLOWY ⇄ AI)
+          ==================================================================== */}
+      {activeSubTab === 'asset_status' && (
+        <div className="auto-module-body">{renderAssetStatusPanel()}</div>
       )}
 
       {/* ====================================================================

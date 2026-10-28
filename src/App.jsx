@@ -22,6 +22,8 @@ import {
   Activity,
   Bot,
   Cpu,
+  BarChart2,
+  Grid,
 } from 'lucide-react';
 import {
   OKX_REGIONS,
@@ -46,6 +48,7 @@ import {
   autoDiscoverKeyViaWebSocket,
 } from './services/okxApi';
 import AutoTradingPanels from './components/AutoTradingPanels';
+import ChartWorkspace from './components/ChartWorkspace';
 import './App.css';
 
 const STORAGE_KEY = 'okx_trader_credentials_v1';
@@ -181,7 +184,23 @@ export default function App() {
     activePositions: [],
     pendingTargetOrders: [],
     executedOrders: [],
+    assetLedger: [],
+    assetSummary: null,
+    onEmergencyClosePosition: null,
+    onEmergencyCloseAllPositions: null,
+    onSelectWalletAssetForAi: null,
+    onTakeWalletAssetToAi: null,
+    onChangeValuationCcy: null,
   });
+
+  // Fullscreen Chart & Minimized Multi-Chart Grid state
+  const [chartWorkspaceMode, setChartWorkspaceMode] = useState('grid_minimized'); // 'closed' | 'fullscreen' | 'grid_fullscreen' | 'grid_minimized'
+  const [chartFocusedAsset, setChartFocusedAsset] = useState({
+    instId: 'ONDO-USDC',
+    instType: 'SPOT',
+  });
+  const [showOrdersSplitModal, setShowOrdersSplitModal] = useState(false);
+  const [ordersSplitView, setOrdersSplitView] = useState('both'); // 'both' | 'open' | 'executed'
 
   // Order Form State
   const [side, setSide] = useState('buy'); // 'buy' | 'sell'
@@ -310,6 +329,26 @@ export default function App() {
       }
     },
     [activeCategory]
+  );
+
+  // Open Fullscreen Chart or Grid for any instrument across the app
+  const handleOpenChart = useCallback(
+    (rawInstId, rawInstType = 'SPOT', targetMode = 'fullscreen') => {
+      let cleanId = String(rawInstId || instId || 'ONDO-USDC').trim();
+      // If label is from AI Swap like "BTC ➔ SOL (SOL-USDC)", extract the pair in parentheses
+      const parenMatch = cleanId.match(/\(([A-Z0-9-]+)\)/i);
+      if (parenMatch && parenMatch[1]) {
+        cleanId = parenMatch[1].toUpperCase();
+      } else if (!cleanId.includes('-')) {
+        cleanId = `${cleanId.toUpperCase()}-USDC`;
+      }
+      const resolvedType =
+        rawInstType === 'SWAP' || cleanId.endsWith('-SWAP') ? 'SWAP' : 'SPOT';
+      setChartFocusedAsset({ instId: cleanId, instType: resolvedType });
+      setChartWorkspaceMode(targetMode);
+      setShowOrdersSplitModal(false);
+    },
+    [instId]
   );
 
   // Load full catalog of instruments + tickers when activeCategory or region changes
@@ -1032,6 +1071,59 @@ export default function App() {
             </span>
             <span className="status-dot" />
           </button>
+
+          {/* Przycisk Historii Zleceń (z podziałem na Otwarte i Zrealizowane) obok statusu API */}
+          <button
+            type="button"
+            className={`top-action-btn orders-history-top-btn ${
+              showOrdersSplitModal ? 'active' : ''
+            }`}
+            onClick={() => setShowOrdersSplitModal(true)}
+            title="Otwórz podgląd zleceń z podziałem na Otwarte Pozycje/Zlecenia oraz Zrealizowane Zlecenia"
+          >
+            <History size={15} />
+            <span>Historia Zleceń</span>
+            <span className="orders-split-pill open-part">
+              Otwarte: {activePositions.length + combinedPendingOrders.length}
+            </span>
+            <span className="orders-split-pill exec-part">
+              Zrealizowane: {combinedOrderHistory.length}
+            </span>
+          </button>
+
+          {/* Przycisk Wykres (otwierający wykres każdego aktywa na pełny ekran + Siatka Grid) obok Historii Zleceń */}
+          <button
+            type="button"
+            className={`top-action-btn chart-top-btn ${
+              chartWorkspaceMode === 'fullscreen' ? 'active' : ''
+            }`}
+            onClick={() => handleOpenChart(instId, instType, 'fullscreen')}
+            title="Otwórz pełnoekranowy wykres dla dowolnego aktywa z możliwością minimalizacji do siatki Grid"
+          >
+            <BarChart2 size={15} />
+            <span>Wykres ({instId})</span>
+          </button>
+
+          <button
+            type="button"
+            className={`top-action-btn grid-top-btn ${
+              chartWorkspaceMode === 'grid_minimized' ||
+              chartWorkspaceMode === 'grid_fullscreen'
+                ? 'active'
+                : ''
+            }`}
+            onClick={() =>
+              setChartWorkspaceMode((prev) =>
+                prev === 'grid_minimized'
+                  ? 'grid_fullscreen'
+                  : 'grid_minimized'
+              )
+            }
+            title="Pokaż zminimalizowaną siatkę wykresów Grid lub przełącz na pełną siatkę"
+          >
+            <Grid size={15} />
+            <span>Siatka Wykresów Grid</span>
+          </button>
         </div>
       </header>
 
@@ -1087,6 +1179,15 @@ export default function App() {
                     })
                   : '—'}
               </span>
+              <button
+                type="button"
+                className="secondary-sm-btn"
+                onClick={() => handleOpenChart(instId, instType, 'fullscreen')}
+                title="Otwórz wykres na cały ekran"
+              >
+                <BarChart2 size={13} />
+                Pełny Wykres
+              </button>
             </div>
 
             <div className="stat-item">
@@ -1154,6 +1255,22 @@ export default function App() {
           </div>
         )}
       </section>
+
+      {/* Fullscreen Chart & Minimized Multi-Chart Grid Workspace */}
+      <ChartWorkspace
+        mode={chartWorkspaceMode}
+        setMode={setChartWorkspaceMode}
+        focusedInstId={chartFocusedAsset.instId || instId}
+        focusedInstType={chartFocusedAsset.instType || instType}
+        onChangeFocusedAsset={(newId, newType) =>
+          setChartFocusedAsset({ instId: newId, instType: newType || 'SPOT' })
+        }
+        onSelectForTrading={selectInstrument}
+        allInstruments={allInstruments}
+        allTickersMap={allTickersMap}
+        activePositions={activePositions}
+        region={credentials.region || 'global'}
+      />
 
       {/* Main 4-Column Trading Workspace */}
       <main className="trading-grid-4col">
@@ -1762,157 +1879,344 @@ export default function App() {
           </form>
         </section>
 
-        {/* Column 4: Account Balances */}
+        {/* Column 4: Account Balances (Portfel Handlowy + Live AI Asset Status) */}
         <section className="card balance-card">
           <div className="card-header">
             <div className="header-with-icon">
               <Wallet size={17} />
               <h2>Portfel Handlowy</h2>
             </div>
-            <button
-              type="button"
-              className="icon-refresh-btn"
-              onClick={loadPrivateData}
-              disabled={!hasCredentials || isLoadingPrivate}
-              title="Odśwież salda"
-            >
-              <RefreshCw
-                size={15}
-                className={isLoadingPrivate ? 'spin' : ''}
-              />
-            </button>
-          </div>
-
-          {!hasCredentials ? (
-            <div className="empty-auth-state">
-              <KeyRound size={28} />
-              <p>
-                Połącz klucze OKX API, aby widzieć salda, pozycje i składać
-                zlecenia.
-              </p>
-              <button
-                type="button"
-                className="primary-outline-btn"
-                onClick={() => setShowKeyModal(true)}
-              >
-                Skonfiguruj klucze API
-              </button>
-            </div>
-          ) : (
-            <>
-              {privateError && (
-                <div
-                  className="feedback-banner error"
-                  style={{ marginBottom: '12px', flexDirection: 'column' }}
-                >
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '8px',
-                    }}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              {automationBook.assetSummary && (
+                <div className="unit-switch mini-ccy-switch">
+                  <button
+                    type="button"
+                    className={
+                      (automationBook.assetSummary.valuationCcy || 'USDC') ===
+                      'USDC'
+                        ? 'active'
+                        : ''
+                    }
+                    onClick={() =>
+                      automationBook.onChangeValuationCcy &&
+                      automationBook.onChangeValuationCcy('USDC')
+                    }
+                    title="Przelicz wartości w Portfelu Handlowym i Panelu Stanu Aktywów na USDC (Domyślnie)"
                   >
-                    <AlertCircle size={16} />
-                    <strong>{privateError}</strong>
-                  </div>
-                  <div
-                    style={{
-                      display: 'flex',
-                      gap: '6px',
-                      flexWrap: 'wrap',
-                      marginTop: '6px',
-                    }}
+                    USDC
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      automationBook.assetSummary.valuationCcy === 'USDG'
+                        ? 'active'
+                        : ''
+                    }
+                    onClick={() =>
+                      automationBook.onChangeValuationCcy &&
+                      automationBook.onChangeValuationCcy('USDG')
+                    }
+                    title="Przelicz wartości w Portfelu Handlowym i Panelu Stanu Aktywów na USDG"
                   >
-                    <button
-                      type="button"
-                      className="secondary-sm-btn"
-                      onClick={() =>
-                        setCredentials((prev) => ({
-                          ...prev,
-                          isDemo: !prev.isDemo,
-                        }))
-                      }
-                    >
-                      Przełącz na {credentials.isDemo ? 'Live' : 'Demo'}
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary-sm-btn"
-                      onClick={() =>
-                        setCredentials((prev) => ({
-                          ...prev,
-                          region: prev.region === 'eea' ? 'global' : 'eea',
-                        }))
-                      }
-                    >
-                      Zmień serwer (
-                      {credentials.region === 'eea' ? 'Global' : 'EEA'})
-                    </button>
-                  </div>
+                    USDG
+                  </button>
                 </div>
               )}
+              <button
+                type="button"
+                className="icon-refresh-btn"
+                onClick={loadPrivateData}
+                disabled={!hasCredentials || isLoadingPrivate}
+                title="Odśwież salda"
+              >
+                <RefreshCw
+                  size={15}
+                  className={isLoadingPrivate ? 'spin' : ''}
+                />
+              </button>
+            </div>
+          </div>
 
-              <div className="equity-box">
-                <span className="equity-label">
-                  Całkowita wartość konta (Equity)
+          {!hasCredentials && (
+            <div className="wallet-compact-auth-banner">
+              <div>
+                <KeyRound size={15} />
+                <span>
+                  Tryb symulacji / demo portfela. Połącz klucze OKX API, aby
+                  pobierać rzeczywiste salda konta.
                 </span>
-                <strong className="equity-value">
-                  $
-                  {Number(accountBalance.totalEq || 0).toLocaleString(
-                    undefined,
-                    { minimumFractionDigits: 2, maximumFractionDigits: 2 }
-                  )}
-                </strong>
               </div>
+              <button
+                type="button"
+                className="secondary-sm-btn"
+                onClick={() => setShowKeyModal(true)}
+              >
+                Klucze API
+              </button>
+            </div>
+          )}
 
-              <div className="asset-list-header">
-                <span>Waluta</span>
-                <span>Dostępne</span>
-                <span>Wartość USD</span>
+          {hasCredentials && privateError && (
+            <div
+              className="feedback-banner error"
+              style={{ marginBottom: '10px', flexDirection: 'column' }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                }}
+              >
+                <AlertCircle size={16} />
+                <strong>{privateError}</strong>
               </div>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: '6px',
+                  flexWrap: 'wrap',
+                  marginTop: '6px',
+                }}
+              >
+                <button
+                  type="button"
+                  className="secondary-sm-btn"
+                  onClick={() =>
+                    setCredentials((prev) => ({
+                      ...prev,
+                      isDemo: !prev.isDemo,
+                    }))
+                  }
+                >
+                  Przełącz na {credentials.isDemo ? 'Live' : 'Demo'}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-sm-btn"
+                  onClick={() =>
+                    setCredentials((prev) => ({
+                      ...prev,
+                      region: prev.region === 'eea' ? 'global' : 'eea',
+                    }))
+                  }
+                >
+                  Zmień serwer (
+                  {credentials.region === 'eea' ? 'Global' : 'EEA'})
+                </button>
+              </div>
+            </div>
+          )}
 
-              <div className="asset-list">
-                {accountBalance.details && accountBalance.details.length > 0 ? (
-                  accountBalance.details.map((item) => (
-                    <div
-                      key={item.ccy}
-                      className="asset-row"
-                      onClick={() => {
-                        setSearchQuery(item.ccy);
-                        setMobileView('markets');
-                      }}
-                      title={`Kliknij aby wyszukać instrumenty dla ${item.ccy}`}
-                    >
-                      <div className="asset-ccy">
-                        <strong>{item.ccy}</strong>
-                        {parseFloat(item.frozenBal || '0') > 0 && (
-                          <small>
-                            Zablok.: {Number(item.frozenBal).toFixed(4)}
-                          </small>
-                        )}
-                      </div>
-                      <span className="asset-avail">
-                        {Number(item.availBal || 0).toLocaleString(undefined, {
-                          maximumFractionDigits: 6,
-                        })}
-                      </span>
-                      <span className="asset-usd">
-                        $
-                        {Number(item.eqUsd || 0).toLocaleString(undefined, {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 2,
-                        })}
-                      </span>
+          {(() => {
+            const summary = automationBook.assetSummary;
+            const vCcy = summary?.valuationCcy || 'USDC';
+            const totalEqDisplay =
+              hasCredentials && Number(accountBalance.totalEq || 0) > 0
+                ? Number(accountBalance.totalEq || 0) *
+                  (summary?.convFactor || 1)
+                : summary?.totalWalletVal || 0;
+
+            return (
+              <>
+                <div className="equity-box">
+                  <span className="equity-label">
+                    Całkowita wartość Portfela ({vCcy})
+                  </span>
+                  <strong className="equity-value">
+                    {totalEqDisplay.toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}{' '}
+                    <small style={{ fontSize: '0.78rem', opacity: 0.85 }}>
+                      {vCcy}
+                    </small>
+                  </strong>
+                </div>
+
+                {/* Live Summary of Taken, Sold & Remaining in USDC/USDG inside Portfel Handlowy */}
+                {summary && (
+                  <div className="wallet-live-summary-grid">
+                    <div className="wallet-summary-mini-item">
+                      <span>Wzięto do handlu (Kupiono)</span>
+                      <strong>
+                        {summary.totalTakenBoughtVal.toFixed(2)} {vCcy}
+                      </strong>
+                      <small style={{ color: '#60a5fa' }}>
+                        Aktywnie: {summary.currentInTradeMarketVal.toFixed(2)}{' '}
+                        {vCcy}
+                      </small>
                     </div>
-                  ))
-                ) : (
-                  <div className="empty-list-msg">
-                    Brak środków na koncie handlowym (Trading Account).
+                    <div className="wallet-summary-mini-item">
+                      <span>Sprzedano łącznie</span>
+                      <strong>
+                        {summary.totalSoldVal.toFixed(2)} {vCcy}
+                      </strong>
+                      <small
+                        className={summary.realizedPnlVal >= 0 ? 'pos' : 'neg'}
+                      >
+                        PnL: {summary.realizedPnlVal >= 0 ? '+' : ''}
+                        {summary.realizedPnlVal.toFixed(2)} {vCcy}
+                      </small>
+                    </div>
+                    <div className="wallet-summary-mini-item">
+                      <span>Zostało do wyboru</span>
+                      <strong style={{ color: '#38bdf8' }}>
+                        {summary.totalRemainingToChooseVal.toFixed(2)} {vCcy}
+                      </strong>
+                      <small>Dostępne dla AI</small>
+                    </div>
                   </div>
                 )}
-              </div>
-            </>
-          )}
+
+                <div className="asset-list-header">
+                  <span>Aktywo / Stan handlu</span>
+                  <span>W portfelu / Do wyboru</span>
+                  <span>Kupiono / Sprzedano ({vCcy})</span>
+                </div>
+
+                <div className="asset-list">
+                  {automationBook.assetLedger &&
+                  automationBook.assetLedger.length > 0 ? (
+                    automationBook.assetLedger.map((row) => (
+                      <div
+                        key={row.ccy}
+                        className={`asset-row asset-row-enriched ${
+                          row.activeQty > 0 ? 'in-ai-trade' : ''
+                        }`}
+                        onClick={() => {
+                          setSearchQuery(row.ccy);
+                          setMobileView('markets');
+                        }}
+                        title={`Kliknij aby wyszukać instrumenty dla ${row.ccy}`}
+                      >
+                        <div className="asset-ccy">
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              flexWrap: 'wrap',
+                            }}
+                          >
+                            <strong>{row.ccy}</strong>
+                            {row.activeQty > 0 && (
+                              <span className="mini-ai-badge">W HANDLU</span>
+                            )}
+                          </div>
+                          <small>
+                            Wzięto: <strong>{row.takenQty.toFixed(4)}</strong> (
+                            Aktywnie: {row.activeQty.toFixed(4)})
+                          </small>
+                          {!row.isStableQuote && (
+                            <div
+                              className="wallet-row-quick-btns"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                className="wallet-mini-action-btn"
+                                onClick={() =>
+                                  automationBook.onSelectWalletAssetForAi &&
+                                  automationBook.onSelectWalletAssetForAi(
+                                    row.ccy
+                                  )
+                                }
+                                title="Wybierz to aktywo w Konfiguracji Autonomicznego Agenta AI"
+                              >
+                                Wybierz w AI
+                              </button>
+                              {row.remainingToChooseQty > 0 && (
+                                <button
+                                  type="button"
+                                  className="wallet-mini-action-btn take"
+                                  onClick={() =>
+                                    automationBook.onTakeWalletAssetToAi &&
+                                    automationBook.onTakeWalletAssetToAi(
+                                      row.ccy
+                                    )
+                                  }
+                                  title="Natychmiast weź to aktywo z Portfela Handlowego do handlu AI"
+                                >
+                                  ⚡ Weź do handlu
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="asset-avail-col">
+                          <span className="asset-avail">
+                            {row.walletTotalQty.toLocaleString(undefined, {
+                              maximumFractionDigits: 4,
+                            })}{' '}
+                            {row.ccy}
+                          </span>
+                          <small style={{ color: '#38bdf8' }}>
+                            Do wyboru: {row.remainingToChooseQty.toFixed(4)} (
+                            {row.remainingToChooseVal.toFixed(2)} {vCcy})
+                          </small>
+                        </div>
+
+                        <div className="asset-usd-col">
+                          <span className="asset-usd">
+                            Kup.: {row.totalBoughtVal.toFixed(2)} {vCcy}
+                          </span>
+                          <small>
+                            Sprz.: {row.totalSoldVal.toFixed(2)} {vCcy}
+                          </small>
+                          {(row.realizedPnl !== 0 ||
+                            row.unrealizedPnl !== 0) && (
+                            <small
+                              className={row.totalPnl >= 0 ? 'pos' : 'neg'}
+                            >
+                              PnL: {row.totalPnl >= 0 ? '+' : ''}
+                              {row.totalPnl.toFixed(2)} {vCcy}
+                            </small>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  ) : accountBalance.details &&
+                    accountBalance.details.length > 0 ? (
+                    accountBalance.details.map((item) => (
+                      <div
+                        key={item.ccy}
+                        className="asset-row"
+                        onClick={() => {
+                          setSearchQuery(item.ccy);
+                          setMobileView('markets');
+                        }}
+                      >
+                        <div className="asset-ccy">
+                          <strong>{item.ccy}</strong>
+                        </div>
+                        <span className="asset-avail">
+                          {Number(item.availBal || 0).toLocaleString(
+                            undefined,
+                            {
+                              maximumFractionDigits: 6,
+                            }
+                          )}
+                        </span>
+                        <span className="asset-usd">
+                          $
+                          {Number(item.eqUsd || 0).toLocaleString(undefined, {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="empty-list-msg">
+                      Brak środków na koncie handlowym (Trading Account).
+                    </div>
+                  )}
+                </div>
+              </>
+            );
+          })()}
         </section>
       </main>
 
@@ -1922,10 +2226,12 @@ export default function App() {
         instType={instType}
         ticker={ticker}
         orderBook={orderBook}
+        allTickersMap={allTickersMap}
         credentials={credentials}
         hasCredentials={hasCredentials}
         accountBalance={accountBalance}
         onSelectInstrument={selectInstrument}
+        onOpenChart={handleOpenChart}
         onRefreshPrivateData={loadPrivateData}
         autoBotEnabled={autoBotEnabled}
         setAutoBotEnabled={setAutoBotEnabled}
@@ -1973,17 +2279,41 @@ export default function App() {
             </button>
           </div>
 
-          {hasCredentials && (
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            {activePositions.some((p) => p.isAutomationPosition) && (
+              <button
+                type="button"
+                className="emergency-close-all-btn"
+                onClick={() =>
+                  automationBook.onEmergencyCloseAllPositions?.(false)
+                }
+                title="Awaryjnie zamknij wszystkie otwarte pozycje AI naraz"
+              >
+                🚨 Emergency: Zamknij Wszystkie Pozycje AI
+              </button>
+            )}
+
             <button
               type="button"
               className="secondary-sm-btn"
-              onClick={loadPrivateData}
-              disabled={isLoadingPrivate}
+              onClick={() => handleOpenChart(instId, instType, 'fullscreen')}
             >
-              <RefreshCw size={13} className={isLoadingPrivate ? 'spin' : ''} />
-              Odśwież
+              <BarChart2 size={13} />
+              Wykres Pełnoekranowy
             </button>
-          )}
+
+            {hasCredentials && (
+              <button
+                type="button"
+                className="secondary-sm-btn"
+                onClick={loadPrivateData}
+                disabled={isLoadingPrivate}
+              >
+                <RefreshCw size={13} className={isLoadingPrivate ? 'spin' : ''} />
+                Odśwież
+              </button>
+            )}
+          </div>
         </div>
 
         {activeBottomTab === 'positions' ? (
@@ -2003,7 +2333,7 @@ export default function App() {
                     <th>Cena bieżąca</th>
                     <th>Cel TP / SL / Likwidacja</th>
                     <th>Niezrealizowane PnL</th>
-                    <th>Akcja</th>
+                    <th>Wykres i Ręczna Akcja (Emergency)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2020,9 +2350,9 @@ export default function App() {
                       <tr key={`${pos.instId}-${pos.posSide}-${pos.mgnMode}`}>
                         <td>
                           <strong
-                            style={{ cursor: 'pointer' }}
+                            style={{ cursor: 'pointer', color: '#60a5fa' }}
                             onClick={() =>
-                              selectInstrument(pos.instId, pos.instType, true)
+                              handleOpenChart(pos.instId, pos.instType, 'fullscreen')
                             }
                           >
                             {pos.instId}
@@ -2059,25 +2389,38 @@ export default function App() {
                           </strong>
                         </td>
                         <td>
-                          {pos.isAutomationPosition ? (
+                          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                             <button
                               type="button"
                               className="secondary-sm-btn"
                               onClick={() =>
-                                selectInstrument(pos.instId, pos.instType, true)
+                                handleOpenChart(pos.instId, pos.instType, 'fullscreen')
                               }
                             >
-                              Pokaż wykres
+                              📈 Pokaż wykres
                             </button>
-                          ) : (
-                            <button
-                              type="button"
-                              className="cancel-ord-btn"
-                              onClick={() => handleClosePosition(pos)}
-                            >
-                              Zamknij Market
-                            </button>
-                          )}
+                            {pos.isAutomationPosition ? (
+                              <button
+                                type="button"
+                                className="emergency-single-close-btn"
+                                onClick={() =>
+                                  automationBook.onEmergencyClosePosition?.(
+                                    pos.instId
+                                  )
+                                }
+                              >
+                                🚨 Zamknij pozycję
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="cancel-ord-btn"
+                                onClick={() => handleClosePosition(pos)}
+                              >
+                                Zamknij Market
+                              </button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -2104,7 +2447,7 @@ export default function App() {
                     <th>Cena docelowa</th>
                     <th>Ilość</th>
                     <th>Status / Wypełniono</th>
-                    <th>Akcja</th>
+                    <th>Wykres i Akcja</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2115,9 +2458,9 @@ export default function App() {
                       </td>
                       <td>
                         <strong
-                          style={{ cursor: 'pointer' }}
+                          style={{ cursor: 'pointer', color: '#60a5fa' }}
                           onClick={() =>
-                            selectInstrument(ord.instId, 'SPOT', true)
+                            handleOpenChart(ord.instId, ord.instType, 'fullscreen')
                           }
                         >
                           {ord.instId}
@@ -2138,22 +2481,41 @@ export default function App() {
                       <td>{ord.sz}</td>
                       <td>{ord.accFillSz || '0'}</td>
                       <td>
-                        {ord.isAutomationTarget ? (
-                          <span className="state-pill state-live">
-                            Aktywny TP/SL
-                          </span>
-                        ) : (
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
                           <button
                             type="button"
-                            className="cancel-ord-btn"
+                            className="secondary-sm-btn"
                             onClick={() =>
-                              handleCancelOrder(ord.instId, ord.ordId)
+                              handleOpenChart(ord.instId, ord.instType, 'fullscreen')
                             }
                           >
-                            <XCircle size={14} />
-                            Anuluj
+                            📈 Pokaż wykres
                           </button>
-                        )}
+                          {ord.isAutomationTarget ? (
+                            <button
+                              type="button"
+                              className="emergency-single-close-btn"
+                              onClick={() =>
+                                automationBook.onEmergencyClosePosition?.(
+                                  ord.instId
+                                )
+                              }
+                            >
+                              🚨 Zamknij pozycję
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="cancel-ord-btn"
+                              onClick={() =>
+                                handleCancelOrder(ord.instId, ord.ordId)
+                              }
+                            >
+                              <XCircle size={14} />
+                              Anuluj
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -2177,7 +2539,7 @@ export default function App() {
                   <th>Śr. cena wykonania</th>
                   <th>Wykonano / Ilość</th>
                   <th>PnL ($)</th>
-                  <th>Status</th>
+                  <th>Status / Wykres</th>
                 </tr>
               </thead>
               <tbody>
@@ -2190,7 +2552,14 @@ export default function App() {
                         ).toLocaleString()}
                     </td>
                     <td>
-                      <strong>{ord.instId}</strong>
+                      <strong
+                        style={{ cursor: 'pointer', color: '#60a5fa' }}
+                        onClick={() =>
+                          handleOpenChart(ord.instId, 'SPOT', 'fullscreen')
+                        }
+                      >
+                        {ord.instId}
+                      </strong>
                     </td>
                     <td className="uppercase">{ord.ordType}</td>
                     <td>
@@ -2232,9 +2601,20 @@ export default function App() {
                         : '—'}
                     </td>
                     <td>
-                      <span className="state-pill state-filled">
-                        {ord.state}
-                      </span>
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                        <span className="state-pill state-filled">
+                          {ord.state}
+                        </span>
+                        <button
+                          type="button"
+                          className="secondary-sm-btn"
+                          onClick={() =>
+                            handleOpenChart(ord.instId, 'SPOT', 'fullscreen')
+                          }
+                        >
+                          📈 Pokaż wykres
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -2243,6 +2623,306 @@ export default function App() {
           </div>
         )}
       </section>
+
+      {/* Top Button Modal: Podział na Otwarte Zlecenia/Pozycje oraz Zrealizowane Zlecenia */}
+      {showOrdersSplitModal && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setShowOrdersSplitModal(false)}
+        >
+          <div
+            className="modal-card orders-split-modal-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <h3>
+                  📋 Historia i Stan Zleceń: Podział na Otwarte i Zrealizowane
+                </h3>
+                <p className="modal-desc" style={{ margin: 0 }}>
+                  Zarządzaj otwartymi pozycjami Agenta AI / OKX, przeglądaj
+                  zrealizowane transakcje i otwieraj wykresy pełnoekranowe
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                {activePositions.some((p) => p.isAutomationPosition) && (
+                  <button
+                    type="button"
+                    className="emergency-close-all-btn"
+                    onClick={() =>
+                      automationBook.onEmergencyCloseAllPositions?.(false)
+                    }
+                  >
+                    🚨 Emergency: Zamknij Wszystkie ({activePositions.length})
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={() => setShowOrdersSplitModal(false)}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="orders-split-filter-bar">
+              <button
+                type="button"
+                className={`orders-tab ${
+                  ordersSplitView === 'both' ? 'active' : ''
+                }`}
+                onClick={() => setOrdersSplitView('both')}
+              >
+                Podział 50/50: Otwarte ({activePositions.length + combinedPendingOrders.length}) + Zrealizowane ({combinedOrderHistory.length})
+              </button>
+              <button
+                type="button"
+                className={`orders-tab ${
+                  ordersSplitView === 'open' ? 'active' : ''
+                }`}
+                onClick={() => setOrdersSplitView('open')}
+              >
+                Tylko Otwarte Pozycje i Zlecenia ({activePositions.length + combinedPendingOrders.length})
+              </button>
+              <button
+                type="button"
+                className={`orders-tab ${
+                  ordersSplitView === 'executed' ? 'active' : ''
+                }`}
+                onClick={() => setOrdersSplitView('executed')}
+              >
+                Tylko Zrealizowane Zlecenia ({combinedOrderHistory.length})
+              </button>
+            </div>
+
+            <div className={`orders-split-grid view-${ordersSplitView}`}>
+              {/* LEFT / TOP SECTION: OPEN POSITIONS & PENDING ORDERS */}
+              {(ordersSplitView === 'both' || ordersSplitView === 'open') && (
+                <div className="orders-split-column">
+                  <div className="split-col-header open-col">
+                    <Clock size={15} />
+                    <strong>
+                      1. Otwarte Pozycje ({activePositions.length}) oraz Oczekujące Zlecenia TP/SL ({combinedPendingOrders.length})
+                    </strong>
+                  </div>
+
+                  {activePositions.length === 0 &&
+                  combinedPendingOrders.length === 0 ? (
+                    <div className="orders-empty">
+                      Brak otwartych pozycji i oczekujących zleceń.
+                    </div>
+                  ) : (
+                    <div className="table-responsive">
+                      <table className="orders-table">
+                        <thead>
+                          <tr>
+                            <th>Instrument</th>
+                            <th>Typ / Źródło</th>
+                            <th>Ilość / Cena</th>
+                            <th>PnL / Cel TP</th>
+                            <th>Wykres / Emergency</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activePositions.map((pos) => {
+                            const upl = parseFloat(pos.upl || '0');
+                            const uplRatio = (
+                              parseFloat(pos.uplRatio || '0') * 100
+                            ).toFixed(2);
+                            return (
+                              <tr key={`m-pos-${pos.instId}`}>
+                                <td>
+                                  <strong>{pos.instId}</strong>
+                                </td>
+                                <td>{pos.mgnMode}</td>
+                                <td>
+                                  {pos.pos} @ {pos.avgPx} (Teraz: {pos.markPx})
+                                </td>
+                                <td className={upl >= 0 ? 'pos' : 'neg'}>
+                                  <strong>
+                                    {upl >= 0 ? '+' : ''}
+                                    {upl.toFixed(4)} ({uplRatio}%)
+                                  </strong>
+                                  <div>
+                                    <small>{pos.liqPx}</small>
+                                  </div>
+                                </td>
+                                <td>
+                                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                                    <button
+                                      type="button"
+                                      className="secondary-sm-btn"
+                                      onClick={() =>
+                                        handleOpenChart(
+                                          pos.instId,
+                                          pos.instType,
+                                          'fullscreen'
+                                        )
+                                      }
+                                    >
+                                      📈 Pokaż wykres
+                                    </button>
+                                    {pos.isAutomationPosition ? (
+                                      <button
+                                        type="button"
+                                        className="emergency-single-close-btn"
+                                        onClick={() =>
+                                          automationBook.onEmergencyClosePosition?.(
+                                            pos.instId
+                                          )
+                                        }
+                                      >
+                                        🚨 Zamknij
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        className="cancel-ord-btn"
+                                        onClick={() => handleClosePosition(pos)}
+                                      >
+                                        Zamknij
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          {combinedPendingOrders.map((ord) => (
+                            <tr key={`m-ord-${ord.ordId}`}>
+                              <td>
+                                <strong>{ord.instId}</strong>
+                              </td>
+                              <td>{ord.instType}</td>
+                              <td>
+                                {ord.side.toUpperCase()} {ord.sz}
+                              </td>
+                              <td>Cel: {ord.px}</td>
+                              <td>
+                                <button
+                                  type="button"
+                                  className="secondary-sm-btn"
+                                  onClick={() =>
+                                    handleOpenChart(
+                                      ord.instId,
+                                      'SPOT',
+                                      'fullscreen'
+                                    )
+                                  }
+                                >
+                                  📈 Pokaż wykres
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* RIGHT / BOTTOM SECTION: EXECUTED / FILLED ORDERS HISTORY */}
+              {(ordersSplitView === 'both' ||
+                ordersSplitView === 'executed') && (
+                <div className="orders-split-column">
+                  <div className="split-col-header exec-col">
+                    <CheckCircle2 size={15} />
+                    <strong>
+                      2. Zrealizowane Zlecenia i Zamknięte Transakcje ({combinedOrderHistory.length})
+                    </strong>
+                  </div>
+
+                  {combinedOrderHistory.length === 0 ? (
+                    <div className="orders-empty">
+                      Brak zrealizowanych zleceń w historii.
+                    </div>
+                  ) : (
+                    <div className="table-responsive">
+                      <table className="orders-table">
+                        <thead>
+                          <tr>
+                            <th>Czas</th>
+                            <th>Instrument</th>
+                            <th>Strona / Ilość</th>
+                            <th>Cena / PnL</th>
+                            <th>Wykres</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {combinedOrderHistory.map((ord) => (
+                            <tr key={`m-hist-${ord.ordId}`}>
+                              <td>
+                                {ord.timeLabel ||
+                                  new Date(
+                                    Number(ord.uTime || ord.cTime)
+                                  ).toLocaleTimeString()}
+                              </td>
+                              <td>
+                                <strong>{ord.instId}</strong>
+                                <div>
+                                  <small>{ord.ordType}</small>
+                                </div>
+                              </td>
+                              <td>
+                                <span
+                                  className={`badge ${
+                                    ord.side === 'buy'
+                                      ? 'badge-buy'
+                                      : ord.side === 'swap'
+                                      ? 'badge-swap'
+                                      : 'badge-sell'
+                                  }`}
+                                >
+                                  {(
+                                    ord.sideLabel ||
+                                    ord.side ||
+                                    'BUY'
+                                  ).toUpperCase()}
+                                </span>{' '}
+                                {ord.sz}
+                              </td>
+                              <td>
+                                <div>{ord.avgPx || ord.px}</div>
+                                {ord.pnl && ord.pnl !== '0' && (
+                                  <strong
+                                    className={
+                                      parseFloat(ord.pnl) >= 0 ? 'pos' : 'neg'
+                                    }
+                                  >
+                                    PnL: {parseFloat(ord.pnl) >= 0 ? '+' : ''}$
+                                    {Number(ord.pnl).toFixed(3)}
+                                  </strong>
+                                )}
+                              </td>
+                              <td>
+                                <button
+                                  type="button"
+                                  className="secondary-sm-btn"
+                                  onClick={() =>
+                                    handleOpenChart(
+                                      ord.instId,
+                                      'SPOT',
+                                      'fullscreen'
+                                    )
+                                  }
+                                >
+                                  📈 Pokaż wykres
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* API Credentials Configuration Modal */}
       {showKeyModal && (
