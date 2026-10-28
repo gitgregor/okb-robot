@@ -224,22 +224,11 @@ export default function App() {
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [orderFeedback, setOrderFeedback] = useState(null);
 
-  // Separate Master States for Automated Rule Bot & Autonomous AI Agent (persisted & synced across devices)
-  const [autoBotEnabled, setAutoBotEnabled] = useState(() => {
-    try {
-      return localStorage.getItem('okx_autobot_enabled_v2') === 'true';
-    } catch {
-      return false;
-    }
-  });
-  const [aiAgentEnabled, setAiAgentEnabled] = useState(() => {
-    try {
-      return localStorage.getItem('okx_ai_agent_enabled_v2') === 'true';
-    } catch {
-      return false;
-    }
-  });
+  // Separate Master States for Automated Rule Bot & Autonomous AI Agent (default to DEZAKTYWOWANY / false until confirmed)
+  const [autoBotEnabled, setAutoBotEnabled] = useState(false);
+  const [aiAgentEnabled, setAiAgentEnabled] = useState(false);
   const [userToggleSignal, setUserToggleSignal] = useState(0);
+  const [externalModuleCmd, setExternalModuleCmd] = useState(null);
 
   useEffect(() => {
     try {
@@ -269,6 +258,16 @@ export default function App() {
       typeof nextVal === 'boolean' ? nextVal : !prev
     );
     setUserToggleSignal(Date.now());
+  }, []);
+
+  const triggerExternalModuleAction = useCallback((module, action) => {
+    setExternalModuleCmd({ module, action, ts: Date.now() });
+    if (action === 'select' || action === 'start') {
+      const el = document.getElementById('automation-hub-section');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }
   }, []);
 
   const hasCredentials = Boolean(
@@ -1035,31 +1034,73 @@ export default function App() {
             </button>
           </div>
 
-          <button
-            type="button"
-            className={`top-module-status-pill ${
-              autoBotEnabled ? 'bot-on' : 'bot-off'
-            }`}
-            onClick={() => handleUserToggleAutoBot()}
-            title="Kliknij aby włączyć/wyłączyć Automatyczny Handel (Reguły)"
-          >
-            <Bot size={14} />
-            <span>Auto-Bot: {autoBotEnabled ? 'AKTYWNY' : 'WYŁ.'}</span>
-            <span className="status-dot" />
-          </button>
+          {/* Auto-Bot Group: Module Button (defaults to deactivated) + Start Handlu + Stop Handlu */}
+          <div className="top-module-control-group">
+            <button
+              type="button"
+              className={`top-module-status-pill ${
+                autoBotEnabled ? 'bot-on' : 'bot-off'
+              }`}
+              onClick={() => triggerExternalModuleAction('autobot', 'select')}
+              title="Przejdź do Auto-Bota (domyślnie dezaktywowany do konfiguracji)"
+            >
+              <Bot size={14} />
+              <span>
+                Auto-Bot: {autoBotEnabled ? 'AKTYWNY' : 'DEZAKTYWOWANY'}
+              </span>
+              <span className="status-dot" />
+            </button>
+            <button
+              type="button"
+              className="top-mini-trade-btn start"
+              onClick={() => triggerExternalModuleAction('autobot', 'start')}
+              title="Start Handlu Auto-Bota (otwiera potwierdzenie konfiguracji)"
+            >
+              Start Handlu
+            </button>
+            <button
+              type="button"
+              className="top-mini-trade-btn stop"
+              onClick={() => triggerExternalModuleAction('autobot', 'stop')}
+              title="Stop Handlu Auto-Bota (dezaktywuj)"
+            >
+              Stop Handlu
+            </button>
+          </div>
 
-          <button
-            type="button"
-            className={`top-module-status-pill ${
-              aiAgentEnabled ? 'ai-on' : 'bot-off'
-            }`}
-            onClick={() => handleUserToggleAiAgent()}
-            title="Kliknij aby aktywować/deaktywować Autonomicznego Agenta AI"
-          >
-            <Cpu size={14} />
-            <span>Agent AI: {aiAgentEnabled ? 'AKTYWNY' : 'WYŁ.'}</span>
-            <span className="status-dot" />
-          </button>
+          {/* Agent AI Group: Module Button (defaults to deactivated) + Start Handlu + Stop Handlu */}
+          <div className="top-module-control-group">
+            <button
+              type="button"
+              className={`top-module-status-pill ${
+                aiAgentEnabled ? 'ai-on' : 'bot-off'
+              }`}
+              onClick={() => triggerExternalModuleAction('ai_agent', 'select')}
+              title="Przejdź do Agenta AI (domyślnie dezaktywowany do konfiguracji)"
+            >
+              <Cpu size={14} />
+              <span>
+                Agent AI: {aiAgentEnabled ? 'AKTYWNY' : 'DEZAKTYWOWANY'}
+              </span>
+              <span className="status-dot" />
+            </button>
+            <button
+              type="button"
+              className="top-mini-trade-btn start-ai"
+              onClick={() => triggerExternalModuleAction('ai_agent', 'start')}
+              title="Start Handlu Agenta AI (otwiera potwierdzenie konfiguracji)"
+            >
+              Start Handlu
+            </button>
+            <button
+              type="button"
+              className="top-mini-trade-btn stop"
+              onClick={() => triggerExternalModuleAction('ai_agent', 'stop')}
+              title="Stop Handlu Agenta AI (dezaktywuj)"
+            >
+              Stop Handlu
+            </button>
+          </div>
 
           <button
             type="button"
@@ -2283,6 +2324,7 @@ export default function App() {
         setAiAgentEnabled={setAiAgentEnabled}
         onUserToggleAiAgent={handleUserToggleAiAgent}
         userToggleSignal={userToggleSignal}
+        externalModuleCmd={externalModuleCmd}
         onSyncAutomationBook={setAutomationBook}
       />
 

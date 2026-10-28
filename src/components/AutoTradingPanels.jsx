@@ -164,6 +164,7 @@ export default function AutoTradingPanels({
   setAiAgentEnabled,
   onUserToggleAiAgent,
   userToggleSignal,
+  externalModuleCmd,
 }) {
   const deviceIdRef = useRef(getOrCreateDeviceId());
   const localUpdatedAtRef = useRef((() => {
@@ -185,6 +186,20 @@ export default function AutoTradingPanels({
     connected: false,
     lastSyncTime: null,
     remoteDevice: null,
+  });
+
+  // Draggable Confirmation Pop-up state for starting Agent AI or Auto-Bot
+  const [confirmTradePopup, setConfirmTradePopup] = useState({
+    open: false,
+    module: null, // 'ai_agent' | 'autobot'
+  });
+  const [popupDragPos, setPopupDragPos] = useState({ x: 0, y: 0 });
+  const popupDragRef = useRef({
+    dragging: false,
+    startX: 0,
+    startY: 0,
+    origX: 0,
+    origY: 0,
   });
 
   // ============================================================================
@@ -1224,11 +1239,11 @@ export default function AutoTradingPanels({
         // ignore
       }
 
-      if (typeof packet.autoBotEnabled === 'boolean') {
-        setAutoBotEnabled(packet.autoBotEnabled);
+      if (packet.autoBotEnabled === false) {
+        setAutoBotEnabled(false);
       }
-      if (typeof packet.aiAgentEnabled === 'boolean') {
-        setAiAgentEnabled(packet.aiAgentEnabled);
+      if (packet.aiAgentEnabled === false) {
+        setAiAgentEnabled(false);
       }
       if (packet.autoSettings) {
         setAutoSettings((prev) => ({ ...prev, ...packet.autoSettings }));
@@ -2954,25 +2969,183 @@ export default function AutoTradingPanels({
     }));
   };
 
-  const handleToggleAutoBotClick = () => {
-    if (onUserToggleAutoBot) {
-      onUserToggleAutoBot();
-    } else {
-      const next = !autoBotEnabled;
-      setAutoBotEnabled(next);
-      publishCrossDeviceState({ autoBotEnabled: next });
-    }
-  };
+  const setModuleActiveState = useCallback(
+    (moduleKey, nextActive) => {
+      if (moduleKey === 'ai_agent') {
+        if (onUserToggleAiAgent) {
+          onUserToggleAiAgent(nextActive);
+        } else {
+          setAiAgentEnabled(nextActive);
+          publishCrossDeviceState({ aiAgentEnabled: nextActive });
+        }
+      } else if (moduleKey === 'autobot') {
+        if (onUserToggleAutoBot) {
+          onUserToggleAutoBot(nextActive);
+        } else {
+          setAutoBotEnabled(nextActive);
+          publishCrossDeviceState({ autoBotEnabled: nextActive });
+        }
+      }
+    },
+    [
+      onUserToggleAiAgent,
+      setAiAgentEnabled,
+      publishCrossDeviceState,
+      onUserToggleAutoBot,
+      setAutoBotEnabled,
+    ]
+  );
 
-  const handleToggleAiAgentClick = () => {
-    if (onUserToggleAiAgent) {
-      onUserToggleAiAgent();
-    } else {
-      const next = !aiAgentEnabled;
-      setAiAgentEnabled(next);
-      publishCrossDeviceState({ aiAgentEnabled: next });
+  // Clicking "Agent AI" or "Auto-Bot" button: sets the module to DEZAKTYWOWANY by default, switches to its tab, and opens confirmation popup
+  const handleSelectModuleButton = useCallback(
+    (moduleKey) => {
+      setActiveSubTab(moduleKey);
+      setModuleActiveState(moduleKey, false);
+      if (moduleKey === 'ai_agent') {
+        setAiLiveStatus((prev) => ({
+          ...prev,
+          currentThought:
+            '⚪ Agent AI jest w stanie dezaktywowanym. Skonfiguruj parametry handlu i naciśnij „Start Handlu” (lub potwierdź w okienku pop-up).',
+        }));
+      } else if (moduleKey === 'autobot') {
+        setAutoBotCycleState((prev) => ({
+          ...prev,
+          lastStatusMsg:
+            '⚪ Auto-Bot jest w stanie dezaktywowanym. Skonfiguruj parametry handlu i naciśnij „Start Handlu” (lub potwierdź w okienku pop-up).',
+        }));
+      }
+      setConfirmTradePopup({ open: true, module: moduleKey });
+    },
+    [setModuleActiveState]
+  );
+
+  // Clicking "Start Handlu": opens confirmation popup for Agent AI or Auto-Bot
+  const handleStartTradingButton = useCallback((moduleKey) => {
+    setActiveSubTab(moduleKey);
+    setConfirmTradePopup({ open: true, module: moduleKey });
+  }, []);
+
+  // Clicking "Stop Handlu": immediately sets Agent AI or Auto-Bot to DEZAKTYWOWANY
+  const handleStopTradingButton = useCallback(
+    (moduleKey) => {
+      setModuleActiveState(moduleKey, false);
+      if (moduleKey === 'ai_agent') {
+        setAiLiveStatus((prev) => ({
+          ...prev,
+          isScanning: false,
+          currentThought:
+            '⚪ Handel Agenta AI zatrzymany (Stop Handlu — stan: DEZAKTYWOWANY). Aby uruchomić ponownie, naciśnij „Start Handlu”.',
+        }));
+      } else if (moduleKey === 'autobot') {
+        setAutoBotCycleState((prev) => ({
+          ...prev,
+          lastStatusMsg:
+            '⚪ Handel Auto-Bota zatrzymany (Stop Handlu — stan: DEZAKTYWOWANY). Aby uruchomić ponownie, naciśnij „Start Handlu”.',
+        }));
+      }
+      setConfirmTradePopup((prev) =>
+        prev.module === moduleKey ? { open: false, module: null } : prev
+      );
+    },
+    [setModuleActiveState]
+  );
+
+  // Pop-up "Tak skonfigurowałem": activates trading and closes pop-up
+  const handleConfirmPopupYes = useCallback(() => {
+    const targetMod = confirmTradePopup.module;
+    setConfirmTradePopup({ open: false, module: null });
+    if (!targetMod) return;
+    setActiveSubTab(targetMod);
+    setModuleActiveState(targetMod, true);
+  }, [confirmTradePopup.module, setModuleActiveState]);
+
+  // Pop-up "Nie skonfigurowałem": does NOT start trading, closes pop-up, waits for user configuration and pressing Start Handlu again
+  const handleConfirmPopupNo = useCallback(() => {
+    const targetMod = confirmTradePopup.module;
+    setConfirmTradePopup({ open: false, module: null });
+    if (!targetMod) return;
+    setActiveSubTab(targetMod);
+    setModuleActiveState(targetMod, false);
+    if (targetMod === 'ai_agent') {
+      setAiLiveStatus((prev) => ({
+        ...prev,
+        currentThought:
+          '⚙️ Oczekiwanie na konfigurację parametrów handlu Agenta AI. Skonfiguruj parametry poniżej, a następnie naciśnij „Start Handlu” i wybierz „Tak skonfigurowałem”.',
+      }));
+    } else if (targetMod === 'autobot') {
+      setAutoBotCycleState((prev) => ({
+        ...prev,
+        lastStatusMsg:
+          '⚙️ Oczekiwanie na konfigurację parametrów handlu Auto-Bota. Skonfiguruj parametry poniżej, a następnie naciśnij „Start Handlu” i wybierz „Tak skonfigurowałem”.',
+      }));
     }
-  };
+  }, [confirmTradePopup.module, setModuleActiveState]);
+
+  // Listen to external commands from top navigation bar in App.jsx
+  useEffect(() => {
+    if (!externalModuleCmd || !externalModuleCmd.ts) return;
+    const { module, action } = externalModuleCmd;
+    if (action === 'select') {
+      handleSelectModuleButton(module);
+    } else if (action === 'start') {
+      handleStartTradingButton(module);
+    } else if (action === 'stop') {
+      handleStopTradingButton(module);
+    }
+  }, [
+    externalModuleCmd,
+    handleSelectModuleButton,
+    handleStartTradingButton,
+    handleStopTradingButton,
+  ]);
+
+  // Drag handlers for the movable confirmation pop-up
+  const handlePopupDragStart = useCallback(
+    (e) => {
+      if (e.target.closest('button')) return;
+      const clientX =
+        e.touches && e.touches.length > 0 ? e.touches[0].clientX : e.clientX;
+      const clientY =
+        e.touches && e.touches.length > 0 ? e.touches[0].clientY : e.clientY;
+      popupDragRef.current = {
+        dragging: true,
+        startX: clientX,
+        startY: clientY,
+        origX: popupDragPos.x,
+        origY: popupDragPos.y,
+      };
+
+      const onMove = (moveEvt) => {
+        if (!popupDragRef.current.dragging) return;
+        const cx =
+          moveEvt.touches && moveEvt.touches.length > 0
+            ? moveEvt.touches[0].clientX
+            : moveEvt.clientX;
+        const cy =
+          moveEvt.touches && moveEvt.touches.length > 0
+            ? moveEvt.touches[0].clientY
+            : moveEvt.clientY;
+        setPopupDragPos({
+          x: popupDragRef.current.origX + (cx - popupDragRef.current.startX),
+          y: popupDragRef.current.origY + (cy - popupDragRef.current.startY),
+        });
+      };
+
+      const onUp = () => {
+        popupDragRef.current.dragging = false;
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        window.removeEventListener('touchmove', onMove);
+        window.removeEventListener('touchend', onUp);
+      };
+
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+      window.addEventListener('touchmove', onMove, { passive: true });
+      window.addEventListener('touchend', onUp);
+    },
+    [popupDragPos.x, popupDragPos.y]
+  );
 
   // Take a chosen asset from Portfel Handlowy into active AI trading
   const handleTakeWalletAssetToAi = useCallback(
@@ -3923,7 +4096,52 @@ export default function AutoTradingPanels({
   };
 
   return (
-    <section className="card automation-hub-card">
+    <section
+      id="automation-hub-section"
+      className="card automation-hub-card"
+    >
+      {/* Compact Draggable Confirmation Pop-up for Agent AI & Auto-Bot */}
+      {confirmTradePopup.open && (
+        <div
+          className="trade-confirm-floating-popup"
+          style={{
+            transform: `translate(calc(-50% + ${popupDragPos.x}px), ${popupDragPos.y}px)`,
+          }}
+          onMouseDown={handlePopupDragStart}
+          onTouchStart={handlePopupDragStart}
+        >
+          <div className="trade-confirm-popup-dragbar">
+            <span className="trade-confirm-module-tag">
+              {confirmTradePopup.module === 'ai_agent'
+                ? '🤖 Agent AI'
+                : '⚙️ Auto-Bot'}
+            </span>
+            <span className="trade-confirm-drag-hint">⠿ przesuń okienko</span>
+          </div>
+
+          <div className="trade-confirm-popup-text">
+            Czy skonfigurowałeś poprawnie parametry handlu
+          </div>
+
+          <div className="trade-confirm-popup-actions">
+            <button
+              type="button"
+              className="trade-confirm-btn yes-btn"
+              onClick={handleConfirmPopupYes}
+            >
+              Tak skonfigurowałem
+            </button>
+            <button
+              type="button"
+              className="trade-confirm-btn no-btn"
+              onClick={handleConfirmPopupNo}
+            >
+              Nie skonfigurowałem
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Top Status & Module Switcher Header */}
       <div className="automation-hub-header">
         <div className="automation-subtabs">
@@ -3932,14 +4150,14 @@ export default function AutoTradingPanels({
             className={`auto-subtab ${
               activeSubTab === 'autobot' ? 'active' : ''
             }`}
-            onClick={() => setActiveSubTab('autobot')}
+            onClick={() => handleSelectModuleButton('autobot')}
           >
             <Bot size={16} />
-            <span>1. Automatyczny Handel (Reguły)</span>
+            <span>1. Auto-Bot (Reguły)</span>
             <span
               className={`mini-status-pill ${autoBotEnabled ? 'on' : 'off'}`}
             >
-              {autoBotEnabled ? 'WŁĄCZONY' : 'WYŁ.'}
+              {autoBotEnabled ? 'AKTYWNY' : 'DEZAKTYWOWANY'}
             </span>
           </button>
 
@@ -3948,16 +4166,16 @@ export default function AutoTradingPanels({
             className={`auto-subtab ${
               activeSubTab === 'ai_agent' ? 'active' : ''
             }`}
-            onClick={() => setActiveSubTab('ai_agent')}
+            onClick={() => handleSelectModuleButton('ai_agent')}
           >
             <Cpu size={16} />
-            <span>2. Autonomiczny Agent AI (Multi-Market)</span>
+            <span>2. Autonomiczny Agent AI</span>
             <span
               className={`mini-status-pill ${
                 aiAgentEnabled ? 'ai-on' : 'off'
               }`}
             >
-              {aiAgentEnabled ? 'AKTYWNY' : 'WYŁ.'}
+              {aiAgentEnabled ? 'AKTYWNY' : 'DEZAKTYWOWANY'}
             </span>
           </button>
 
@@ -4041,11 +4259,11 @@ export default function AutoTradingPanels({
               />
               <div>
                 <h3>
-                  Moduł Automatycznego Handlu Regułowego
+                  Moduł Automatycznego Handlu Regułowego (Auto-Bot)
                   <span className={autoBotEnabled ? 'live-tag' : 'off-tag'}>
                     {autoBotEnabled
-                      ? '🟢 STATUS: WŁĄCZONY (PRACUJE)'
-                      : '⚪ STATUS: WYŁĄCZONY'}
+                      ? '🟢 STATUS AUTO-BOTA: AKTYWNY (PRACUJE)'
+                      : '⚪ STATUS AUTO-BOTA: DEZAKTYWOWANY'}
                   </span>
                 </h3>
                 <p>
@@ -4066,24 +4284,29 @@ export default function AutoTradingPanels({
                 <Play size={14} />
                 Testuj cykl teraz
               </button>
+
               <button
                 type="button"
-                className={`master-power-btn ${
-                  autoBotEnabled ? 'turn-off' : 'turn-on'
+                className={`master-power-btn turn-on ${
+                  autoBotEnabled ? 'btn-active-glow' : ''
                 }`}
-                onClick={handleToggleAutoBotClick}
+                onClick={() => handleStartTradingButton('autobot')}
+                title="Uruchom Auto-Bota (wyświetli potwierdzenie konfiguracji parametrów)"
               >
-                {autoBotEnabled ? (
-                  <>
-                    <Square size={15} />
-                    Wyłącz Automatyczny Handel
-                  </>
-                ) : (
-                  <>
-                    <Power size={15} />
-                    Włącz Automatyczny Handel
-                  </>
-                )}
+                <Play size={15} />
+                Start Handlu
+              </button>
+
+              <button
+                type="button"
+                className={`master-power-btn turn-off ${
+                  !autoBotEnabled ? 'btn-stopped-dim' : ''
+                }`}
+                onClick={() => handleStopTradingButton('autobot')}
+                title="Zatrzymaj Auto-Bota i zmień stan na dezaktywowany"
+              >
+                <Square size={15} />
+                Stop Handlu
               </button>
             </div>
           </div>
@@ -4457,22 +4680,26 @@ export default function AutoTradingPanels({
 
               <button
                 type="button"
-                className={`master-power-btn ${
-                  aiAgentEnabled ? 'turn-off' : 'turn-on-ai'
+                className={`master-power-btn turn-on-ai ${
+                  aiAgentEnabled ? 'btn-active-glow' : ''
                 }`}
-                onClick={handleToggleAiAgentClick}
+                onClick={() => handleStartTradingButton('ai_agent')}
+                title="Uruchom Agenta AI (wyświetli potwierdzenie konfiguracji parametrów)"
               >
-                {aiAgentEnabled ? (
-                  <>
-                    <Square size={15} />
-                    Dezaktywuj Agenta AI
-                  </>
-                ) : (
-                  <>
-                    <Zap size={15} />
-                    Aktywuj Agenta AI
-                  </>
-                )}
+                <Zap size={15} />
+                Start Handlu
+              </button>
+
+              <button
+                type="button"
+                className={`master-power-btn turn-off ${
+                  !aiAgentEnabled ? 'btn-stopped-dim' : ''
+                }`}
+                onClick={() => handleStopTradingButton('ai_agent')}
+                title="Zatrzymaj Agenta AI i zmień stan na dezaktywowany"
+              >
+                <Square size={15} />
+                Stop Handlu
               </button>
             </div>
           </div>

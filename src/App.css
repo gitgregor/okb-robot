@@ -3389,4 +3389,166 @@ body {
   font-size: 0.75rem;
 }
 
+/* =========================================================
+   COMPACT DRAGGABLE CONFIRMATION POP-UP & START/STOP CONTROLS
+   ========================================================= */
+.top-module-control-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  padding: 2px 4px;
+}
+
+.top-mini-trade-btn {
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 0.69rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.top-mini-trade-btn.start {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(16, 185, 129, 0.55);
+  color: #6ee7b7;
+}
+
+.top-mini-trade-btn.start:hover {
+  background: #10b981;
+  color: #06281e;
+}
+
+.top-mini-trade-btn.start-ai {
+  background: rgba(168, 85, 247, 0.24);
+  border-color: rgba(168, 85, 247, 0.6);
+  color: #e9d5ff;
+}
+
+.top-mini-trade-btn.start-ai:hover {
+  background: #9333ea;
+  color: #ffffff;
+}
+
+.top-mini-trade-btn.stop {
+  background: rgba(244, 63, 94, 0.16);
+  border-color: rgba(244, 63, 94, 0.48);
+  color: #fda4af;
+}
+
+.top-mini-trade-btn.stop:hover {
+  background: #e11d48;
+  color: #ffffff;
+}
+
+.btn-active-glow {
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.45);
+}
+
+.btn-stopped-dim {
+  opacity: 0.72;
+}
+
+/* Compact Draggable Pop-up */
+.trade-confirm-floating-popup {
+  position: fixed;
+  top: 105px;
+  left: 50%;
+  z-index: 2900;
+  width: 280px;
+  max-width: 92vw;
+  background: rgba(13, 19, 31, 0.97);
+  border: 1px solid #38bdf8;
+  border-radius: 10px;
+  padding: 9px 11px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65), 0 0 14px rgba(56, 189, 248, 0.25);
+  cursor: grab;
+  user-select: none;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.trade-confirm-floating-popup:active {
+  cursor: grabbing;
+}
+
+.trade-confirm-popup-dragbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.trade-confirm-module-tag {
+  font-size: 0.68rem;
+  font-weight: 800;
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.14);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.trade-confirm-drag-hint {
+  font-size: 0.64rem;
+  color: var(--text-secondary);
+}
+
+.trade-confirm-popup-text {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.35;
+  text-align: center;
+  padding: 2px 0;
+}
+
+.trade-confirm-popup-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.trade-confirm-btn {
+  flex: 1;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: none;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.trade-confirm-btn.yes-btn {
+  background: rgba(16, 185, 129, 0.22);
+  border: 1px solid rgba(16, 185, 129, 0.65);
+  color: #6ee7b7;
+}
+
+.trade-confirm-btn.yes-btn:hover {
+  background: #10b981;
+  color: #052e16;
+}
+
+.trade-confirm-btn.no-btn {
+  background: rgba(244, 63, 94, 0.18);
+  border: 1px solid rgba(244, 63, 94, 0.55);
+  color: #fda4af;
+}
+
+.trade-confirm-btn.no-btn:hover {
+  background: #e11d48;
+  color: #ffffff;
+}
+
 
